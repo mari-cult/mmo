@@ -37,6 +37,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_addr(VirtAddr::new(crate::process::timer_handler_addr() as u64));
     }
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_interrupt_handler);
+    idt[255].set_handler_fn(apic_spurious_interrupt_handler);
     unsafe {
         idt.page_fault
             .set_handler_fn(page_fault_handler)
@@ -47,13 +48,16 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
 pub fn init() {
     IDT.load();
-    unsafe { 
+    unsafe {
         PICS.lock().initialize();
         // Unmask all interrupts on both PICs
         Port::<u8>::new(0x21).write(0x00);
         Port::<u8>::new(0xA1).write(0x00);
     };
-    x86_64::instructions::interrupts::enable();
+}
+
+pub fn load_local() {
+    IDT.load();
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -72,8 +76,12 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: x86_64::structures::idt::PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    let fault_addr = Cr2::read().expect("failed to read CR2");
+    if let Ok(true) = crate::reclaim::handle_page_fault(fault_addr) {
+        return;
+    }
     println!("EXCEPTION: PAGE FAULT");
-    println!("Accessed Address: {:?}", Cr2::read());
+    println!("Accessed Address: {:?}", fault_addr);
     println!("Error Code: {:?}", error_code);
     println!("{:#?}", stack_frame);
     panic!("Page Fault");
@@ -88,4 +96,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }
+}
+
+extern "x86-interrupt" fn apic_spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::apic::complete_interrupt();
 }

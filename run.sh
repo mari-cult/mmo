@@ -1,28 +1,39 @@
 #!/bin/bash
 set -e
 
-# Build the kernel for UEFI target
-echo "Building the kernel (UEFI target)..."
-# We need to build with -Zbuild-std since we're no_std but need some core/alloc features
-cargo build -p kernel --target x86_64-unknown-uefi -Zbuild-std=core,alloc
+# Build the kernel for the freestanding target so Limine can load it directly.
+echo "Building the kernel (Limine target)..."
+cargo build -p kernel
 
-KERNEL_EFI="target/x86_64-unknown-uefi/debug/kernel.efi"
+KERNEL_BIN="target/x86_64-unknown-none/debug/kernel"
+LIMINE_BOOT="limine/bin/BOOTX64.EFI"
 
-# Create a temporary directory for the FAT-emulated disk
+# Create a temporary directory for the FAT-emulated Limine disk.
 EFI_ROOT="efi_root"
 rm -rf "$EFI_ROOT"
 mkdir -p "$EFI_ROOT/EFI/BOOT"
+mkdir -p "$EFI_ROOT/boot/limine"
 
-# In UEFI, the default boot file for x64 is /EFI/BOOT/BOOTX64.EFI
-cp "$KERNEL_EFI" "$EFI_ROOT/EFI/BOOT/BOOTX64.EFI"
+cp "$LIMINE_BOOT" "$EFI_ROOT/EFI/BOOT/BOOTX64.EFI"
+cp "$KERNEL_BIN" "$EFI_ROOT/kernel"
+cat > "$EFI_ROOT/limine.conf" <<'EOF'
+timeout: 0
+verbose: yes
 
-# Run in QEMU using its built-in FAT emulation (VVFAT) pointing to EFI_ROOT
-echo "Running in QEMU (using UEFI boot)..."
+/Linux-Like Kernel
+    protocol: limine
+    path: boot():/kernel
+EOF
+cp "$EFI_ROOT/limine.conf" "$EFI_ROOT/boot/limine/limine.conf"
+cp "$EFI_ROOT/limine.conf" "$EFI_ROOT/EFI/BOOT/limine.conf"
+
+# Run in QEMU using Limine's UEFI binary as the default boot application.
+echo "Running in QEMU (using Limine UEFI boot)..."
 qemu-system-x86_64 \
     -smp 2 \
     -accel tcg,thread=multi \
-    -device virtio-gpu-pci \
     -bios DEBUGX64_OVMF.fd \
     -drive file=fat:rw:"$EFI_ROOT",format=raw \
     -serial stdio \
+    -display none \
     -m 256M

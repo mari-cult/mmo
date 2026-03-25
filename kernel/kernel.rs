@@ -8,25 +8,56 @@ extern crate alloc;
 compile_error!("This kernel only supports x86_64");
 
 pub mod allocator;
+pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
 pub mod process;
+pub mod reclaim;
 pub mod serial;
+pub mod smp;
 pub mod syscall;
 pub mod zram;
-pub mod apic;
 
 use core::{arch::asm, panic::PanicInfo};
-use limine::request::{HhdmRequest, MemoryMapRequest};
+use limine::{
+    BaseRevision,
+    request::{
+        EntryPointRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+        StackSizeRequest,
+    },
+};
+
+const LIMINE_STACK_SIZE: u64 = 1024 * 1024;
 
 #[used]
-#[unsafe(link_section = ".requests")]
+#[unsafe(link_section = ".limine_requests_start_marker")]
+static REQUESTS_START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(6);
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
-#[unsafe(link_section = ".requests")]
+#[unsafe(link_section = ".limine_requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new().with_size(LIMINE_STACK_SIZE);
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static ENTRY_POINT_REQUEST: EntryPointRequest =
+    EntryPointRequest::new().with_entry_point(kernel_main);
+
+#[used]
+#[unsafe(link_section = ".limine_requests_end_marker")]
+static REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -34,6 +65,13 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
+#[cfg(not(target_os = "uefi"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    kernel_main()
+}
+
+#[cfg(target_os = "uefi")]
 #[uefi::entry]
 fn efi_main(
     handle: uefi::Handle,
@@ -71,7 +109,7 @@ fn efi_main(
 
     // Transition to the kernel
     println!("Transitioning to kernel..."); // This might not work if UEFI console is gone
-    
+
     kernel_main()
 }
 
@@ -81,19 +119,25 @@ pub extern "C" fn kernel_main() -> ! {
         asm!("cli");
     }
     println!("LINUX-LIKE KERNEL: Initializing (CPU INTERRUPTS DISABLED)...");
+    if BASE_REVISION.is_valid() {
+        println!(
+            "LINUX-LIKE KERNEL: Limine base revision loaded={}",
+            BASE_REVISION.loaded_revision().unwrap_or(0)
+        );
+    }
 
-    gdt::init();
-    idt::init();
-    apic::init();
-    println!("LINUX-LIKE KERNEL: GDT/IDT/APIC initialized.");
-
+    let mut reclaim_demo_base = None;
     if let Some(hhdm) = HHDM_REQUEST.get_response() {
         let physical_memory_offset = x86_64::VirtAddr::new(hhdm.offset());
+        apic::set_hhdm_offset(physical_memory_offset);
         let mut mapper = unsafe { paging::init(physical_memory_offset) };
         if let Some(mmap) = MEMORY_MAP_REQUEST.get_response() {
             let mut frame_allocator = allocator::BootInfoFrameAllocator::init_from_limine(mmap);
             allocator::init_heap(&mut mapper, &mut frame_allocator)
                 .expect("Heap initialization failed");
+            allocator::init_runtime(physical_memory_offset, frame_allocator);
+            reclaim_demo_base =
+                Some(reclaim::allocate_region(3).expect("failed to allocate reclaim demo region"));
         }
     } else {
         println!(
@@ -103,20 +147,124 @@ pub extern "C" fn kernel_main() -> ! {
 
     println!("LINUX-LIKE KERNEL: Heap initialized.");
 
+    gdt::init();
+    idt::init();
+    apic::init();
+    println!("LINUX-LIKE KERNEL: GDT/IDT/APIC initialized.");
+
+    let topology = smp::init();
+    process::configure_topology(topology.online_cpus);
+    println!(
+        "LINUX-LIKE KERNEL: SMP topology online_cpus={}, discovered_cpus={}, bsp_lapic_id={}",
+        topology.online_cpus, topology.discovered_cpus, topology.bootstrap_lapic_id
+    );
+
     syscall::init();
     println!("LINUX-LIKE KERNEL: Syscalls initialized.");
 
-    // Demo: Compressed Storage
-    let original = b"This is a long string that will be compressed using lz4_flex in our kernel's zram-like storage system.";
-    let compressed = zram::CompressedStorage::new(original);
-    println!(
-        "LINUX-LIKE KERNEL: Compressed {} bytes to {} bytes",
-        original.len(),
-        compressed.size()
+    if let Some(reclaim_base) = reclaim_demo_base {
+        unsafe {
+            for offset in 0..zram::PAGE_SIZE {
+                reclaim_base
+                    .as_mut_ptr::<u8>()
+                    .add(offset)
+                    .write((offset % 251) as u8);
+                reclaim_base
+                    .as_mut_ptr::<u8>()
+                    .add(zram::PAGE_SIZE + offset)
+                    .write(((offset * 3) % 251) as u8);
+                reclaim_base
+                    .as_mut_ptr::<u8>()
+                    .add(2 * zram::PAGE_SIZE + offset)
+                    .write(0x5a);
+            }
+        }
+
+        reclaim::reclaim_page(reclaim_base + zram::PAGE_SIZE as u64)
+            .expect("failed to reclaim page 1");
+        reclaim::reclaim_page(reclaim_base + (2 * zram::PAGE_SIZE) as u64)
+            .expect("failed to reclaim page 2");
+
+        let restored_byte_1 = unsafe {
+            reclaim_base
+                .as_ptr::<u8>()
+                .add(zram::PAGE_SIZE + 123)
+                .read_volatile()
+        };
+        let restored_byte_2 = unsafe {
+            reclaim_base
+                .as_ptr::<u8>()
+                .add(2 * zram::PAGE_SIZE + 17)
+                .read_volatile()
+        };
+        assert_eq!(restored_byte_1, ((123 * 3) % 251) as u8);
+        assert_eq!(restored_byte_2, 0x5a);
+
+        let reclaim_stats = reclaim::stats();
+        println!(
+            "LINUX-LIKE KERNEL: reclaim allocated_pages={}, resident_pages={}, compressed_pages={}, reclaims={}, restored_faults={}",
+            reclaim_stats.allocated_pages,
+            reclaim_stats.resident_pages,
+            reclaim_stats.compressed_pages,
+            reclaim_stats.reclaims,
+            reclaim_stats.restored_faults
+        );
+    } else {
+        println!("LINUX-LIKE KERNEL: reclaim demo unavailable without Limine memory services");
+    }
+
+    let mut zram_device = zram::ZramDevice::new(64);
+    let mut zswap_cache = zram::ZswapCache::new(64);
+
+    let mut raw_page = [0u8; zram::PAGE_SIZE];
+    let mut seed = 0x1234_5678u32;
+    for byte in raw_page.iter_mut() {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *byte = (seed >> 24) as u8;
+    }
+
+    let mut compressible_page = [0u8; zram::PAGE_SIZE];
+    for (index, byte) in compressible_page.iter_mut().enumerate() {
+        *byte = if index % 2 == 0 { b'A' } else { b'B' };
+    }
+
+    zram_device
+        .store_page(0, &raw_page)
+        .expect("zram store failed");
+    zram_device
+        .store_page(1, &compressible_page)
+        .expect("zram store failed");
+    let raw_roundtrip = zram_device.load_page(0).expect("zram load failed");
+    let compressed_roundtrip = zram_device.load_page(1).expect("zram load failed");
+    assert_eq!(raw_page.as_slice(), raw_roundtrip.as_slice());
+    assert_eq!(
+        compressible_page.as_slice(),
+        compressed_roundtrip.as_slice()
     );
-    let decompressed = compressed.decompress();
-    assert_eq!(original.as_slice(), decompressed.as_slice());
-    println!("LINUX-LIKE KERNEL: Decompression successful!");
+
+    zswap_cache
+        .store(7, &compressible_page)
+        .expect("zswap store failed");
+    let zswap_roundtrip = zswap_cache.load(7).expect("zswap load failed");
+    assert_eq!(compressible_page.as_slice(), zswap_roundtrip.as_slice());
+    zswap_cache.invalidate(7).expect("zswap invalidate failed");
+
+    let zram_stats = zram_device.stats();
+    let zswap_stats = zswap_cache.stats();
+    println!(
+        "LINUX-LIKE KERNEL: zram stores={}, loads={}, raw_pages={}, compressed_pages={}, logical_bytes={}, stored_bytes={}, zspages={}",
+        zram_stats.stores,
+        zram_stats.loads,
+        zram_stats.raw_pages,
+        zram_stats.compressed_pages,
+        zram_stats.logical_bytes,
+        zram_stats.stored_bytes,
+        zram_stats.allocator.zspages
+    );
+    println!(
+        "LINUX-LIKE KERNEL: zswap hits={}, misses={}, backend_invalidations={}",
+        zswap_stats.hits, zswap_stats.misses, zswap_stats.backend.invalidations
+    );
 
     let task1 = process::Task::with_params(
         1,

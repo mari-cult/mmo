@@ -267,6 +267,21 @@ impl Scheduler {
         self.enqueue_task(task_id);
     }
 
+    pub fn configure_topology(&mut self, cpu_count: usize) {
+        if !self.tasks.is_empty() || self.started {
+            return;
+        }
+
+        let cpu_count = cpu_count.max(1);
+        self.cpus = (0..cpu_count)
+            .map(|cpu| CpuRunQueue::new(CpuId(cpu), 0))
+            .collect();
+        self.llc_domains = vec![LlcDomain {
+            id: 0,
+            cpus: (0..cpu_count).map(CpuId).collect(),
+        }];
+    }
+
     pub fn start(&mut self) -> Option<usize> {
         self.started = true;
         self.pick_next_task(CpuId(0), None)
@@ -553,8 +568,10 @@ impl Scheduler {
         for pass in 0..2 {
             let mut best_task_id = None;
             let mut best_vruntime = u64::MAX;
-            let queue_snapshot: Vec<usize> =
-                self.cpus[cpu.0].queues[class.index()].iter().copied().collect();
+            let queue_snapshot: Vec<usize> = self.cpus[cpu.0].queues[class.index()]
+                .iter()
+                .copied()
+                .collect();
 
             for task_id in queue_snapshot {
                 let task = self.task(task_id);
@@ -616,7 +633,9 @@ fn task_quantum(class: TaskClass, nice: i8) -> i64 {
 }
 
 fn vruntime_delta(class: TaskClass, nice: i8) -> u64 {
-    let weight = CLASS_WEIGHTS[class.index()].saturating_mul(nice_weight(nice)).max(1);
+    let weight = CLASS_WEIGHTS[class.index()]
+        .saturating_mul(nice_weight(nice))
+        .max(1);
     1024 / weight
 }
 
@@ -625,7 +644,9 @@ const fn align_down(value: usize, align: usize) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn scheduler_timer_tick(current_ctx: *mut SavedTaskContext) -> *const SavedTaskContext {
+pub extern "sysv64" fn scheduler_timer_tick(
+    current_ctx: *mut SavedTaskContext,
+) -> *const SavedTaskContext {
     let next_ctx = {
         let mut scheduler = SCHEDULER.lock();
         scheduler.on_timer_tick(current_ctx as usize)
@@ -649,6 +670,12 @@ pub fn start() -> ! {
     .expect("scheduler started without a runnable task");
 
     unsafe { restore_task_context(next_ctx as *const SavedTaskContext) }
+}
+
+pub fn configure_topology(cpu_count: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().configure_topology(cpu_count);
+    });
 }
 
 pub fn timer_handler_addr() -> usize {
