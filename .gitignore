@@ -1,0 +1,8 @@
+target/
+*.fd
+*.img
+/limine
+*.iso
+*.bin
+/efi_root
+/iso_root
