@@ -69,3 +69,9 @@ impl From<ParseError> for WriteError {
         Self::Parse(value)
     }
 }
+
+impl From<core::num::TryFromIntError> for WriteError {
+    fn from(value: core::num::TryFromIntError) -> Self {
+        Self::TryFromInt(value)
+    }
+}

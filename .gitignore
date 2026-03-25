@@ -6,3 +6,5 @@ target/
 *.bin
 /efi_root
 /iso_root
+*.tar.*
+/stage3-root

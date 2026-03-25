@@ -7,6 +7,17 @@ cargo build -p kernel
 
 KERNEL_BIN="target/x86_64-unknown-none/debug/kernel"
 LIMINE_BOOT="limine/bin/BOOTX64.EFI"
+ROOTFS_IMG="rootfs.img"
+STAGE3_TARBALL="${GENTOO_STAGE3_TARBALL:-}"
+STAGING_DIR="${GENTOO_STAGE3_STAGING:-stage3-root}"
+
+if [ -n "$STAGE3_TARBALL" ]; then
+    echo "Importing Gentoo stage3 into $ROOTFS_IMG..."
+    ./tools/import_rootfs.sh "$STAGE3_TARBALL" "$STAGING_DIR" "$ROOTFS_IMG"
+elif [ ! -f "$ROOTFS_IMG" ]; then
+    echo "Creating placeholder rootfs image at $ROOTFS_IMG (64MiB)..."
+    dd if=/dev/zero of="$ROOTFS_IMG" bs=1048576 count=64 status=none
+fi
 
 # Create a temporary directory for the FAT-emulated Limine disk.
 EFI_ROOT="efi_root"
@@ -34,6 +45,8 @@ qemu-system-x86_64 \
     -accel tcg,thread=multi \
     -bios DEBUGX64_OVMF.fd \
     -drive file=fat:rw:"$EFI_ROOT",format=raw \
+    -drive if=none,id=drv0,file="$ROOTFS_IMG",format=raw \
+    -device virtio-blk-pci,drive=drv0 \
     -serial stdio \
     -display none \
     -m 256M

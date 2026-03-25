@@ -11,7 +11,8 @@ use crate::on_disk::inode::{
     Inode, InodeFormat, XFS_DINODE_CRC_OFF, XFS_DINODE_MAGIC, XFS_DINODE_SIZE_V3,
 };
 use crate::on_disk::superblock::{
-    Superblock, V5Fields, XFS_DSB_SIZE, XFS_SB_CRC_OFF, XFS_SB_VERSION_5,
+    Superblock, V5Fields, XFS_DSB_SIZE, XFS_SB_CRC_OFF, XFS_SB_FEAT_INCOMPAT_FTYPE,
+    XFS_SB_VERSION_5,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -98,7 +99,7 @@ pub fn mkfs<D: BlockDevice>(dev: &mut D, opts: &MkfsOptions) -> Result<(), Write
         v5: Some(V5Fields {
             features_compat: 0,
             features_ro_compat: 0,
-            features_incompat: 0,
+            features_incompat: XFS_SB_FEAT_INCOMPAT_FTYPE,
             features_log_incompat: 0,
             crc: 0,
             sparse_inode_align: 8,

@@ -12,11 +12,15 @@ pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod pci;
 pub mod process;
 pub mod reclaim;
 pub mod serial;
 pub mod smp;
 pub mod syscall;
+pub mod user;
+pub mod vfs;
+pub mod virtio_blk;
 pub mod zram;
 
 use core::{arch::asm, panic::PanicInfo};
@@ -27,6 +31,7 @@ use limine::{
         StackSizeRequest,
     },
 };
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 const LIMINE_STACK_SIZE: u64 = 1024 * 1024;
 
@@ -149,6 +154,15 @@ pub extern "C" fn kernel_main() -> ! {
 
     gdt::init();
     idt::init();
+    unsafe {
+        Cr0::update(|cr0| {
+            cr0.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
+            cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+        });
+        Cr4::update(|cr4| {
+            cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
+        });
+    }
     apic::init();
     println!("LINUX-LIKE KERNEL: GDT/IDT/APIC initialized.");
 
@@ -161,6 +175,36 @@ pub extern "C" fn kernel_main() -> ! {
 
     syscall::init();
     println!("LINUX-LIKE KERNEL: Syscalls initialized.");
+
+    let mut init_task = None;
+    match virtio_blk::VirtioBlkDevice::probe() {
+        Ok(dev) => {
+            println!("LINUX-LIKE KERNEL: PCI found modern virtio-blk");
+            match vfs::mount_root(dev) {
+                Ok(()) => {
+                    println!("LINUX-LIKE KERNEL: crabfs root mounted");
+                    match user::create_init_task(3, "/usr/bin/bash") {
+                        Ok(task) => {
+                            println!("LINUX-LIKE KERNEL: PID1 /usr/bin/bash task prepared");
+                            init_task = Some(task);
+                        }
+                        Err(err) => {
+                            println!(
+                                "LINUX-LIKE KERNEL: PID1 /usr/bin/bash prepare failed: {:?}",
+                                err
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!("LINUX-LIKE KERNEL: crabfs mount failed");
+                }
+            }
+        }
+        Err(_) => {
+            println!("LINUX-LIKE KERNEL: no modern virtio-blk device detected");
+        }
+    }
 
     if let Some(reclaim_base) = reclaim_demo_base {
         unsafe {
@@ -266,20 +310,26 @@ pub extern "C" fn kernel_main() -> ! {
         zswap_stats.hits, zswap_stats.misses, zswap_stats.backend.invalidations
     );
 
-    let task1 = process::Task::with_params(
-        1,
-        0,
-        test_task_1,
-        process::SchedParams {
-            class_hint: Some(process::TaskClass::Game),
-            nice: -5,
-            preferred_cpu: Some(process::CpuId(0)),
-        },
-    );
-    let task2 = process::Task::new(2, 0, test_task_2);
+    if let Some(task) = init_task {
+        process::SCHEDULER.lock().add_task(task);
+        println!("LINUX-LIKE KERNEL: added PID1 userspace task");
+    } else {
+        let task1 = process::Task::with_params(
+            1,
+            0,
+            test_task_1,
+            process::SchedParams {
+                class_hint: Some(process::TaskClass::Game),
+                nice: -5,
+                preferred_cpu: Some(process::CpuId(0)),
+            },
+        );
+        let task2 = process::Task::new(2, 0, test_task_2);
 
-    process::SCHEDULER.lock().add_task(task1);
-    process::SCHEDULER.lock().add_task(task2);
+        process::SCHEDULER.lock().add_task(task1);
+        process::SCHEDULER.lock().add_task(task2);
+        println!("LINUX-LIKE KERNEL: using fallback kernel demo tasks");
+    }
 
     println!("LINUX-LIKE KERNEL: Starting scheduler...");
     crate::process::start();

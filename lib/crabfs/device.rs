@@ -41,8 +41,23 @@ impl StdFileDevice {
     ///
     /// * `DeviceError::Io` - If an I/O error occurs.
     pub fn create(path: impl AsRef<std::path::Path>) -> Result<Self, DeviceError> {
-        let file = std::fs::File::create(path).map_err(|_| DeviceError::Io)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|_| DeviceError::Io)?;
         Ok(Self { file })
+    }
+
+    /// Resize the backing file.
+    ///
+    /// # Errors
+    ///
+    /// * `DeviceError::Io` - If an I/O error occurs.
+    pub fn set_len(&mut self, len: u64) -> Result<(), DeviceError> {
+        self.file.set_len(len).map_err(|_| DeviceError::Io)
     }
 }
 
