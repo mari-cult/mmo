@@ -196,6 +196,43 @@ impl Task {
         task.saved_rsp = context_rsp;
         task
     }
+
+    pub fn with_initial_context(
+        id: usize,
+        thread_id: usize,
+        context: SavedTaskContext,
+        params: SchedParams,
+    ) -> Self {
+        let mut task = Self {
+            id,
+            thread_id,
+            state: TaskState::Ready,
+            stack: alloc::vec![0; KERNEL_STACK_SIZE],
+            saved_rsp: 0,
+            class_hint: params.class_hint,
+            class: params.class_hint.unwrap_or(TaskClass::Normal),
+            nice: params.nice.clamp(-20, 19),
+            preferred_cpu: params.preferred_cpu,
+            last_cpu: CpuId(0),
+            runtime_ticks: 0,
+            runnable_avg: 0,
+            vruntime: 0,
+            sleep_credit: 0,
+            deficit: 0,
+            slice_ticks: 0,
+            voluntary_yields: 0,
+            full_slice_runs: 0,
+            sleep_started_at: None,
+            queued: false,
+        };
+        let stack_top = align_down(task.stack.as_ptr() as usize + task.stack.len(), 16);
+        let context_rsp = stack_top - size_of::<SavedTaskContext>();
+        unsafe {
+            *(context_rsp as *mut SavedTaskContext) = context;
+        }
+        task.saved_rsp = context_rsp;
+        task
+    }
 }
 
 #[derive(Debug)]

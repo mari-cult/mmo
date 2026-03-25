@@ -1,5 +1,6 @@
 use crate::crc::verify_xfs_crc;
 use crate::device::BlockDevice;
+use crate::endian::{be_u16, be_u32, be_u64, require_len};
 use crate::error::{DeviceError, ParseError, ReadError};
 use crate::on_disk::agf::{Agf, XFS_AGF_CRC_OFF, XFS_AGF_SIZE};
 use crate::on_disk::agfl::{Agfl, XFS_AGFL_CRC_OFF};
@@ -15,6 +16,7 @@ use alloc::string::{String, ToString};
 use alloc::{vec, vec::Vec};
 
 const XFS_MAX_SECTOR_SIZE: usize = 4096;
+const CRABFS_EXTENT_DIR_MAGIC: [u8; 8] = *b"CDIR0001";
 
 #[inline]
 fn ag_start(sb: &Superblock, agno: u32) -> Result<u64, ReadError> {
@@ -253,21 +255,28 @@ pub fn list_dir_entries<D: BlockDevice>(
             }
             Ok(entries)
         }
-        _ => {
-            // TODO: implement Block/Extent formats
-            Ok(vec![
-                DirEntry {
-                    ino: ino_num,
-                    name: ".".to_string(),
-                    ftype: 2,
-                },
-                DirEntry {
-                    ino: ino_num, // Placeholder parent
-                    name: "..".to_string(),
-                    ftype: 2,
-                },
-            ])
+        crate::on_disk::inode::InodeFormat::Extents => {
+            let data = read_extent_payload(dev, sb, &inode, &scratch, inode.size as u64)?;
+            if data.len() >= CRABFS_EXTENT_DIR_MAGIC.len()
+                && data[..CRABFS_EXTENT_DIR_MAGIC.len()] == CRABFS_EXTENT_DIR_MAGIC
+            {
+                parse_extent_dir_entries(&data, ino_num)
+            } else {
+                Ok(vec![
+                    DirEntry {
+                        ino: ino_num,
+                        name: ".".to_string(),
+                        ftype: 2,
+                    },
+                    DirEntry {
+                        ino: ino_num,
+                        name: "..".to_string(),
+                        ftype: 2,
+                    },
+                ])
+            }
         }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -312,50 +321,106 @@ pub fn read_file_data<D: BlockDevice>(
             Ok(data[offset as usize..end as usize].to_vec())
         }
         crate::on_disk::inode::InodeFormat::Extents => {
-            let fork = &scratch[176..];
-            let mut extents = Vec::new();
-            for i in 0..inode.nextents {
-                #[allow(clippy::cast_possible_truncation)]
-                let ext_bytes = &fork[i as usize * 16..];
-                extents.push(BmapExtent::parse(ext_bytes)?);
-            }
-
-            let mut result = Vec::new();
-            let mut remaining = u64::from(size);
-            let mut current_off = offset;
-            #[allow(clippy::cast_sign_loss)]
-            let file_size = inode.size as u64;
-
-            if current_off >= file_size {
-                return Ok(Vec::new());
-            }
-            remaining = remaining.min(file_size - current_off);
-
-            for ext in extents {
-                let ext_start_bytes = ext.startoff * u64::from(sb.block_size);
-                let ext_len_bytes = u64::from(ext.blockcount) * u64::from(sb.block_size);
-
-                if current_off >= ext_start_bytes && current_off < ext_start_bytes + ext_len_bytes {
-                    let in_ext_off = current_off - ext_start_bytes;
-                    let to_read = (ext_len_bytes - in_ext_off).min(remaining);
-
-                    let phy_off = extent_to_physical_offset(sb, &ext) + in_ext_off;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let mut buf = vec![0u8; to_read as usize];
-                    dev.read_at(phy_off, &mut buf)?;
-                    result.extend_from_slice(&buf);
-
-                    remaining -= to_read;
-                    current_off += to_read;
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-            }
-            Ok(result)
+            read_extent_range(dev, sb, &inode, &scratch, offset, u64::from(size))
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn read_extent_payload<D: BlockDevice>(
+    dev: &mut D,
+    sb: &Superblock,
+    inode: &Inode,
+    scratch: &[u8],
+    size: u64,
+) -> Result<Vec<u8>, ReadError> {
+    read_extent_range(dev, sb, inode, scratch, 0, size)
+}
+
+fn read_extent_range<D: BlockDevice>(
+    dev: &mut D,
+    sb: &Superblock,
+    inode: &Inode,
+    scratch: &[u8],
+    offset: u64,
+    size: u64,
+) -> Result<Vec<u8>, ReadError> {
+    let fork = &scratch[176..];
+    let mut extents = Vec::new();
+    for i in 0..inode.nextents {
+        #[allow(clippy::cast_possible_truncation)]
+        let ext_bytes = &fork[i as usize * 16..];
+        extents.push(BmapExtent::parse(ext_bytes)?);
+    }
+
+    let mut result = Vec::new();
+    let mut remaining = size;
+    let mut current_off = offset;
+    #[allow(clippy::cast_sign_loss)]
+    let file_size = inode.size as u64;
+
+    if current_off >= file_size {
+        return Ok(Vec::new());
+    }
+    remaining = remaining.min(file_size - current_off);
+
+    for ext in extents {
+        let ext_start_bytes = ext.startoff * u64::from(sb.block_size);
+        let ext_len_bytes = u64::from(ext.blockcount) * u64::from(sb.block_size);
+
+        if current_off >= ext_start_bytes && current_off < ext_start_bytes + ext_len_bytes {
+            let in_ext_off = current_off - ext_start_bytes;
+            let to_read = (ext_len_bytes - in_ext_off).min(remaining);
+
+            let phy_off = extent_to_physical_offset(sb, &ext) + in_ext_off;
+            #[allow(clippy::cast_possible_truncation)]
+            let mut buf = vec![0u8; to_read as usize];
+            dev.read_at(phy_off, &mut buf)?;
+            result.extend_from_slice(&buf);
+
+            remaining -= to_read;
+            current_off += to_read;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn parse_extent_dir_entries(data: &[u8], ino_num: u64) -> Result<Vec<DirEntry>, ReadError> {
+    if data.len() < 20 {
+        return Err(ReadError::Parse(ParseError::BufferTooSmall {
+            expected: 20,
+            actual: data.len(),
+        }));
+    }
+    let count = be_u32(data, 8) as usize;
+    let parent = be_u64(data, 12);
+    let mut pos = 20usize;
+    let mut entries = Vec::with_capacity(count + 2);
+    entries.push(DirEntry {
+        ino: ino_num,
+        name: ".".to_string(),
+        ftype: 2,
+    });
+    entries.push(DirEntry {
+        ino: parent,
+        name: "..".to_string(),
+        ftype: 2,
+    });
+    for _ in 0..count {
+        require_len(data, pos + 11)?;
+        let ino = be_u64(data, pos);
+        let ftype = data[pos + 8];
+        let name_len = be_u16(data, pos + 9) as usize;
+        pos += 11;
+        require_len(data, pos + name_len)?;
+        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+        pos += name_len;
+        entries.push(DirEntry { ino, name, ftype });
+    }
+    Ok(entries)
 }
 
 /// # Errors

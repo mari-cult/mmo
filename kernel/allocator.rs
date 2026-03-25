@@ -14,8 +14,9 @@ use x86_64::{PhysAddr, VirtAddr};
 
 pub struct BootInfoFrameAllocator {
     memory_map: &'static [&'static limine::memory_map::Entry],
-    next: usize,
     recycled: Vec<PhysFrame>,
+    current_entry: usize,
+    current_addr: u64,
 }
 
 impl BootInfoFrameAllocator {
@@ -27,20 +28,10 @@ impl BootInfoFrameAllocator {
     pub fn init_from_limine(response: &'static limine::response::MemoryMapResponse) -> Self {
         BootInfoFrameAllocator {
             memory_map: response.entries(),
-            next: 0,
             recycled: Vec::new(),
+            current_entry: 0,
+            current_addr: 0,
         }
-    }
-
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        self.memory_map
-            .into_iter()
-            .filter(|r| unsafe {
-                core::mem::transmute::<limine::memory_map::EntryType, u64>(r.entry_type) == 0
-            })
-            .map(|r| r.base..r.base + r.length)
-            .flat_map(|r| r.step_by(4096))
-            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }
 
@@ -49,14 +40,37 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         if let Some(frame) = self.recycled.pop() {
             return Some(frame);
         }
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
-        frame
+        while self.current_entry < self.memory_map.len() {
+            let entry = self.memory_map[self.current_entry];
+            let usable = unsafe {
+                core::mem::transmute::<limine::memory_map::EntryType, u64>(entry.entry_type) == 0
+            };
+            if !usable {
+                self.current_entry += 1;
+                self.current_addr = 0;
+                continue;
+            }
+
+            let start = entry.base;
+            let end = entry.base + entry.length;
+            if self.current_addr < start {
+                self.current_addr = start;
+            }
+            let addr = self.current_addr;
+            if addr + 4096 <= end {
+                self.current_addr += 4096;
+                return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+            }
+
+            self.current_entry += 1;
+            self.current_addr = 0;
+        }
+        None
     }
 }
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
