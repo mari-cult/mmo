@@ -24,15 +24,27 @@ const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOSPC: i32 = 28;
 const EROFS: i32 = 30;
+const ERANGE: i32 = 34;
 const ENOSYS: i32 = 38;
 const ENAMETOOLONG: i32 = 36;
+const FD_CLOEXEC: i32 = 1;
+const F_DUPFD: i32 = 0;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const F_DUPFD_CLOEXEC: i32 = 1030;
 
 const SYS_READ: usize = 0;
 const SYS_WRITE: usize = 1;
 const SYS_OPEN: usize = 2;
+const SYS_STAT: usize = 4;
 const SYS_CLOSE: usize = 3;
 const SYS_FSTAT: usize = 5;
+const SYS_LSTAT: usize = 6;
+const SYS_FCNTL: usize = 72;
 const SYS_PREAD64: usize = 17;
+const SYS_READV: usize = 19;
 const SYS_LSEEK: usize = 8;
 const SYS_IOCTL: usize = 16;
 const SYS_GETUID: usize = 102;
@@ -62,6 +74,7 @@ const SYS_PRLIMIT64: usize = 302;
 const SYS_CLOCK_GETTIME: usize = 228;
 const SYS_EXIT_GROUP: usize = 231;
 const SYS_OPENAT: usize = 257;
+const SYS_FACCESSAT: usize = 269;
 const SYS_NEWFSTATAT: usize = 262;
 const SYS_READLINKAT: usize = 267;
 const SYS_EXECVE: usize = 59;
@@ -336,6 +349,33 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 Err(e) => neg_errno(from_vfs_err(e)),
             }
         }
+        SYS_READV => {
+            let fd = a0 as i32;
+            let iov = a1 as *const LinuxIovec;
+            let iovcnt = a2;
+            if iov.is_null() {
+                return neg_errno(EFAULT);
+            }
+            let mut total = 0usize;
+            for idx in 0..iovcnt {
+                let ent = unsafe { &mut *(iov.add(idx) as *mut LinuxIovec) };
+                if ent.iov_base.is_null() {
+                    return neg_errno(EFAULT);
+                }
+                let out =
+                    unsafe { core::slice::from_raw_parts_mut(ent.iov_base as *mut u8, ent.iov_len) };
+                match vfs::read(fd, out) {
+                    Ok(n) => {
+                        total = total.saturating_add(n);
+                        if n < ent.iov_len {
+                            break;
+                        }
+                    }
+                    Err(e) => return neg_errno(from_vfs_err(e)),
+                }
+            }
+            total
+        }
         SYS_WRITE => {
             let fd = a0 as i32;
             let buf = a1 as *const u8;
@@ -391,10 +431,70 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
             Ok(()) => 0,
             Err(e) => neg_errno(from_vfs_err(e)),
         },
+        SYS_STAT => {
+            let path = match read_cstr(a0 as *const u8, 4096) {
+                Ok(v) => v,
+                Err(e) => return neg_errno(e),
+            };
+            match vfs::stat_path(&path, true) {
+                Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
+                Err(e) => neg_errno(from_vfs_err(e)),
+            }
+        }
         SYS_FSTAT => match vfs::fstat(a0 as i32) {
             Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
             Err(e) => neg_errno(from_vfs_err(e)),
         },
+        SYS_LSTAT => {
+            let path = match read_cstr(a0 as *const u8, 4096) {
+                Ok(v) => v,
+                Err(e) => return neg_errno(e),
+            };
+            match vfs::stat_path(&path, false) {
+                Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
+                Err(e) => neg_errno(from_vfs_err(e)),
+            }
+        }
+        SYS_FCNTL => {
+            let fd = a0 as i32;
+            let cmd = a1 as i32;
+            let arg = a2 as i32;
+            match cmd {
+                F_GETFD => match vfs::get_fd_flags(fd) {
+                    Ok(flags) => flags as usize,
+                    Err(e) => neg_errno(from_vfs_err(e)),
+                },
+                F_SETFD => match vfs::set_fd_flags(fd, arg & FD_CLOEXEC) {
+                    Ok(()) => 0,
+                    Err(e) => neg_errno(from_vfs_err(e)),
+                },
+                F_GETFL => match vfs::get_status_flags(fd) {
+                    Ok(flags) => flags as usize,
+                    Err(e) => neg_errno(from_vfs_err(e)),
+                },
+                F_SETFL => match vfs::set_status_flags(fd, arg) {
+                    Ok(()) => 0,
+                    Err(e) => neg_errno(from_vfs_err(e)),
+                },
+                F_DUPFD | F_DUPFD_CLOEXEC => match vfs::path_of_fd(fd) {
+                    Ok(path) => {
+                        let status_flags = vfs::get_status_flags(fd).unwrap_or(0);
+                        match vfs::open(&path, status_flags) {
+                            Ok(new_fd) => {
+                                let _ = vfs::set_fd_flags(
+                                    new_fd,
+                                    if cmd == F_DUPFD_CLOEXEC { FD_CLOEXEC } else { 0 },
+                                );
+                                new_fd as usize
+                            }
+                            Err(e) => neg_errno(from_vfs_err(e)),
+                        }
+                    }
+                    Err(e) => neg_errno(from_vfs_err(e)),
+                },
+                _ => neg_errno(ENOSYS),
+            }
+        }
         SYS_PREAD64 => {
             let fd = a0 as i32;
             let buf = a1 as *mut u8;
@@ -417,7 +517,15 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_MMAP => match user::mmap(
             a0 as u64, a1 as u64, a2 as i32, a3 as i32, a4 as i32, a5 as u64,
         ) {
-            Ok(addr) => addr as usize,
+            Ok(addr) => {
+                if (a3 as i32 & 0x20) == 0 {
+                    println!(
+                        "MMAP file-backed: fd={} addr={:#x} len={:#x} off={:#x} -> {:#x}",
+                        a4 as i32, a0, a1, a5, addr
+                    );
+                }
+                addr as usize
+            }
             Err(_) => neg_errno(ENOSYS),
         },
         SYS_MPROTECT => match user::mprotect(a0 as u64, a1 as u64, a2 as i32) {
@@ -480,9 +588,16 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 Ok(v) => v,
                 Err(e) => return neg_errno(e),
             };
+            println!("OPEN path={} flags={:#x}", path, a1);
             match vfs::open(&path, a1 as i32) {
-                Ok(fd) => fd as usize,
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(fd) => {
+                    println!("OPEN ok path={} fd={}", path, fd);
+                    fd as usize
+                }
+                Err(e) => {
+                    println!("OPEN err path={} err={:?}", path, e);
+                    neg_errno(from_vfs_err(e))
+                }
             }
         }
         SYS_OPENAT => {
@@ -490,9 +605,27 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 Ok(v) => v,
                 Err(e) => return neg_errno(e),
             };
+            println!("OPENAT dirfd={} path={} flags={:#x}", a0 as i32, path, a2);
             match vfs::open(&path, a2 as i32) {
-                Ok(fd) => fd as usize,
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(fd) => {
+                    println!("OPENAT ok path={} fd={}", path, fd);
+                    fd as usize
+                }
+                Err(e) => {
+                    println!("OPENAT err path={} err={:?}", path, e);
+                    neg_errno(from_vfs_err(e))
+                }
+            }
+        }
+        SYS_FACCESSAT => {
+            let path = match read_cstr(a1 as *const u8, 4096) {
+                Ok(v) => v,
+                Err(e) => return neg_errno(e),
+            };
+            if vfs::exists(&path) {
+                0
+            } else {
+                neg_errno(ENOENT)
             }
         }
         SYS_NEWFSTATAT => {
@@ -579,5 +712,3 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         }
     }
 }
-
-const ERANGE: i32 = 34;
