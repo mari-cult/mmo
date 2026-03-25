@@ -9,6 +9,7 @@ compile_error!("This kernel only supports x86_64");
 
 pub mod allocator;
 pub mod apic;
+pub mod cmdline;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
@@ -130,7 +131,6 @@ pub extern "C" fn kernel_main() -> ! {
             BASE_REVISION.loaded_revision().unwrap_or(0)
         );
     }
-
     let mut reclaim_demo_base = None;
     if let Some(hhdm) = HHDM_REQUEST.get_response() {
         let physical_memory_offset = x86_64::VirtAddr::new(hhdm.offset());
@@ -151,6 +151,10 @@ pub extern "C" fn kernel_main() -> ! {
     }
 
     println!("LINUX-LIKE KERNEL: Heap initialized.");
+    let params = cmdline::params();
+    if !params.raw.is_empty() {
+        println!("LINUX-LIKE KERNEL: cmdline=\"{}\"", params.raw);
+    }
 
     gdt::init();
     idt::init();
@@ -177,21 +181,41 @@ pub extern "C" fn kernel_main() -> ! {
     println!("LINUX-LIKE KERNEL: Syscalls initialized.");
 
     let mut init_task = None;
-    match virtio_blk::VirtioBlkDevice::probe() {
-        Ok(dev) => {
+    match (
+        cmdline::resolved_root_device(),
+        cmdline::resolved_root_fstype(),
+        virtio_blk::VirtioBlkDevice::probe(),
+    ) {
+        (Some(cmdline::RootDevice::VirtioBlk0), Some(cmdline::RootFsType::Crabfs), Ok(dev)) => {
             println!("LINUX-LIKE KERNEL: PCI found modern virtio-blk");
             match vfs::mount_root(dev) {
                 Ok(()) => {
                     println!("LINUX-LIKE KERNEL: crabfs root mounted");
-                    match user::create_init_task(3, "/usr/bin/bash") {
+                    println!(
+                        "LINUX-LIKE KERNEL: lookup libc={} readline={} ncursesw={} tinfow={}",
+                        vfs::lookup("/usr/lib/libc.so").is_ok(),
+                        vfs::lookup("/usr/lib/libreadline.so.8").is_ok(),
+                        vfs::lookup("/usr/lib/libncursesw.so.6").is_ok(),
+                        vfs::lookup("/usr/lib/libtinfow.so.6").is_ok()
+                    );
+                    if let Ok(path_bytes) = vfs::read_all("/etc/ld-musl-x86_64.path") {
+                        if let Ok(path_text) = core::str::from_utf8(&path_bytes) {
+                            println!(
+                                "LINUX-LIKE KERNEL: ld-musl path file={:?}",
+                                path_text
+                            );
+                        }
+                    }
+                    let init_path = cmdline::resolved_init_path();
+                    match user::create_init_task(3, &init_path) {
                         Ok(task) => {
-                            println!("LINUX-LIKE KERNEL: PID1 /usr/bin/bash task prepared");
+                            println!("LINUX-LIKE KERNEL: PID1 {} task prepared", init_path);
                             init_task = Some(task);
                         }
                         Err(err) => {
                             println!(
-                                "LINUX-LIKE KERNEL: PID1 /usr/bin/bash prepare failed: {:?}",
-                                err
+                                "LINUX-LIKE KERNEL: PID1 {} prepare failed: {:?}",
+                                init_path, err
                             );
                         }
                     }
@@ -201,7 +225,13 @@ pub extern "C" fn kernel_main() -> ! {
                 }
             }
         }
-        Err(_) => {
+        (None, _, _) => {
+            println!("LINUX-LIKE KERNEL: unsupported root= parameter");
+        }
+        (_, None, _) => {
+            println!("LINUX-LIKE KERNEL: unsupported rootfstype= parameter");
+        }
+        (_, _, Err(_)) => {
             println!("LINUX-LIKE KERNEL: no modern virtio-blk device detected");
         }
     }
