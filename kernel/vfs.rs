@@ -30,6 +30,8 @@ struct OpenFile {
     ino: u64,
     offset: u64,
     path: String,
+    fd_flags: i32,
+    status_flags: i32,
 }
 
 pub struct Vfs {
@@ -130,6 +132,8 @@ impl Vfs {
                 ino,
                 offset: 0,
                 path: normalized,
+                fd_flags: 0,
+                status_flags: _flags,
             },
         );
         Ok(fd)
@@ -219,11 +223,51 @@ impl Vfs {
         self.read_symlink_inode(ino)
     }
 
+    fn stat_path(&mut self, path: &str, follow: bool) -> Result<FileStat, VfsError> {
+        let ino = if follow {
+            self.lookup_path(path)?
+        } else {
+            self.lookup_path_nofollow(path)?
+        };
+        let inode = self.read_inode(ino)?;
+        Ok(FileStat {
+            ino,
+            mode: inode.mode,
+            size: inode.size.max(0) as u64,
+        })
+    }
+
     fn path_of_fd(&self, fd: i32) -> Result<String, VfsError> {
         self.files
             .get(&fd)
             .map(|file| file.path.clone())
             .ok_or(VfsError::InvalidFd)
+    }
+
+    fn get_fd_flags(&self, fd: i32) -> Result<i32, VfsError> {
+        self.files
+            .get(&fd)
+            .map(|file| file.fd_flags)
+            .ok_or(VfsError::InvalidFd)
+    }
+
+    fn set_fd_flags(&mut self, fd: i32, flags: i32) -> Result<(), VfsError> {
+        let file = self.files.get_mut(&fd).ok_or(VfsError::InvalidFd)?;
+        file.fd_flags = flags;
+        Ok(())
+    }
+
+    fn get_status_flags(&self, fd: i32) -> Result<i32, VfsError> {
+        self.files
+            .get(&fd)
+            .map(|file| file.status_flags)
+            .ok_or(VfsError::InvalidFd)
+    }
+
+    fn set_status_flags(&mut self, fd: i32, flags: i32) -> Result<(), VfsError> {
+        let file = self.files.get_mut(&fd).ok_or(VfsError::InvalidFd)?;
+        file.status_flags = flags;
+        Ok(())
     }
 }
 
@@ -286,6 +330,12 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, VfsError> {
     v.read_all(path)
 }
 
+pub fn stat_path(path: &str, follow: bool) -> Result<FileStat, VfsError> {
+    let mut g = VFS.lock();
+    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+    v.stat_path(path, follow)
+}
+
 pub fn pread(fd: i32, offset: u64, out: &mut [u8]) -> Result<usize, VfsError> {
     let mut g = VFS.lock();
     let v = g.as_mut().ok_or(VfsError::NotMounted)?;
@@ -296,6 +346,30 @@ pub fn path_of_fd(fd: i32) -> Result<String, VfsError> {
     let g = VFS.lock();
     let v = g.as_ref().ok_or(VfsError::NotMounted)?;
     v.path_of_fd(fd)
+}
+
+pub fn get_fd_flags(fd: i32) -> Result<i32, VfsError> {
+    let g = VFS.lock();
+    let v = g.as_ref().ok_or(VfsError::NotMounted)?;
+    v.get_fd_flags(fd)
+}
+
+pub fn set_fd_flags(fd: i32, flags: i32) -> Result<(), VfsError> {
+    let mut g = VFS.lock();
+    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+    v.set_fd_flags(fd, flags)
+}
+
+pub fn get_status_flags(fd: i32) -> Result<i32, VfsError> {
+    let g = VFS.lock();
+    let v = g.as_ref().ok_or(VfsError::NotMounted)?;
+    v.get_status_flags(fd)
+}
+
+pub fn set_status_flags(fd: i32, flags: i32) -> Result<(), VfsError> {
+    let mut g = VFS.lock();
+    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+    v.set_status_flags(fd, flags)
 }
 
 pub fn getcwd() -> String {
