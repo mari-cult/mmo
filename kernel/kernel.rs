@@ -106,17 +106,6 @@ pub extern "C" fn kernel_main() -> ! {
     syscall::init();
     println!("LINUX-LIKE KERNEL: Syscalls initialized.");
 
-    // Create test tasks
-    let task1 = process::Task::new(1, 0, test_task_1);
-    let task2 = process::Task::new(2, 0, test_task_2);
-
-    process::SCHEDULER.lock().add_task(task1);
-    process::SCHEDULER.lock().add_task(task2);
-
-    println!("LINUX-LIKE KERNEL: Starting scheduler...");
-    crate::process::SCHEDULER.lock().schedule();
-
-    crate::apic::complete_interrupt();
     // Demo: Compressed Storage
     let original = b"This is a long string that will be compressed using lz4_flex in our kernel's zram-like storage system.";
     let compressed = zram::CompressedStorage::new(original);
@@ -129,11 +118,23 @@ pub extern "C" fn kernel_main() -> ! {
     assert_eq!(original.as_slice(), decompressed.as_slice());
     println!("LINUX-LIKE KERNEL: Decompression successful!");
 
-    loop {
-        unsafe {
-            asm!("hlt");
-        }
-    }
+    let task1 = process::Task::with_params(
+        1,
+        0,
+        test_task_1,
+        process::SchedParams {
+            class_hint: Some(process::TaskClass::Game),
+            nice: -5,
+            preferred_cpu: Some(process::CpuId(0)),
+        },
+    );
+    let task2 = process::Task::new(2, 0, test_task_2);
+
+    process::SCHEDULER.lock().add_task(task1);
+    process::SCHEDULER.lock().add_task(task2);
+
+    println!("LINUX-LIKE KERNEL: Starting scheduler...");
+    crate::process::start();
 }
 
 pub extern "C" fn test_task_1() -> ! {

@@ -1,6 +1,7 @@
 use crate::println;
 use pic8259::ChainedPics;
 use spin::Lazy;
+use x86_64::VirtAddr;
 use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
@@ -31,7 +32,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault_handler)
             .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
     }
-    idt[InterruptIndex::Timer as u8].set_handler_fn(timer_interrupt_handler);
+    unsafe {
+        idt[InterruptIndex::Timer as u8]
+            .set_handler_addr(VirtAddr::new(crate::process::timer_handler_addr() as u64));
+    }
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_interrupt_handler);
     unsafe {
         idt.page_fault
@@ -73,19 +77,6 @@ extern "x86-interrupt" fn page_fault_handler(
     println!("Error Code: {:?}", error_code);
     println!("{:#?}", stack_frame);
     panic!("Page Fault");
-}
-
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    static mut COUNT: u32 = 0;
-    unsafe {
-        COUNT += 1;
-        if COUNT % 10 == 0 {
-             println!("TICK");
-        }
-    }
-    crate::process::SCHEDULER.lock().schedule();
-
-    crate::apic::complete_interrupt();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

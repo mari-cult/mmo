@@ -1,13 +1,65 @@
-use crate::println;
-use alloc::collections::vec_deque::VecDeque;
+use crate::{apic, println};
+use alloc::collections::{BTreeMap, vec_deque::VecDeque};
+use alloc::vec;
 use alloc::vec::Vec;
-use core::arch::global_asm;
-use spin::Mutex;
+use core::arch::{asm, global_asm};
+use core::array;
+use core::cmp::min;
+use core::mem::size_of;
+use spin::{Lazy, Mutex};
+use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 global_asm!(include_str!("switch.s"), options(att_syntax));
 
+unsafe extern "sysv64" {
+    fn restore_task_context(next_ctx: *const SavedTaskContext) -> !;
+}
+
 unsafe extern "C" {
-    fn context_switch(old_rsp: *mut usize, new_rsp: usize);
+    fn timer_interrupt_entry();
+}
+
+const KERNEL_STACK_SIZE: usize = 4096 * 4;
+const SCHEDULER_STACK_SIZE: usize = 4096 * 4;
+const NUM_CLASSES: usize = 4;
+const CLASS_QUANTA: [i64; NUM_CLASSES] = [6, 4, 2, 1];
+const CLASS_WEIGHTS: [u64; NUM_CLASSES] = [4, 3, 2, 1];
+const RUNNABLE_SCALE: u64 = 1024;
+const HOG_UTIL_THRESHOLD: u64 = 896;
+const HOG_SLICE_THRESHOLD: u64 = 4;
+const WAKE_CREDIT_PER_TICK: u64 = 32;
+const MAX_SLEEP_CREDIT: u64 = 256;
+
+#[repr(align(16))]
+#[allow(dead_code)]
+pub struct AlignedStack([u8; SCHEDULER_STACK_SIZE]);
+
+#[unsafe(no_mangle)]
+pub static mut SCHEDULER_STACK: AlignedStack = AlignedStack([0; SCHEDULER_STACK_SIZE]);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SavedTaskContext {
+    pub r15: usize,
+    pub r14: usize,
+    pub r13: usize,
+    pub r12: usize,
+    pub r11: usize,
+    pub r10: usize,
+    pub r9: usize,
+    pub r8: usize,
+    pub rbp: usize,
+    pub rdi: usize,
+    pub rsi: usize,
+    pub rdx: usize,
+    pub rcx: usize,
+    pub rbx: usize,
+    pub rax: usize,
+    pub rip: usize,
+    pub cs: usize,
+    pub rflags: usize,
+    pub rsp: usize,
+    pub ss: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,112 +67,629 @@ pub enum TaskState {
     Ready,
     Running,
     Blocked,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TaskClass {
+    Game = 0,
+    Normal = 1,
+    Hog = 2,
+    Background = 3,
+}
+
+impl TaskClass {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Game,
+            1 => Self::Normal,
+            2 => Self::Hog,
+            _ => Self::Background,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuId(pub usize);
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedParams {
+    pub class_hint: Option<TaskClass>,
+    pub nice: i8,
+    pub preferred_cpu: Option<CpuId>,
+}
+
+impl Default for SchedParams {
+    fn default() -> Self {
+        Self {
+            class_hint: None,
+            nice: 0,
+            preferred_cpu: None,
+        }
+    }
 }
 
 pub struct Task {
     pub id: usize,
     pub thread_id: usize,
-    pub rsp: usize,
     pub state: TaskState,
     pub stack: Vec<u8>,
+    pub saved_rsp: usize,
+    pub class_hint: Option<TaskClass>,
+    pub class: TaskClass,
+    pub nice: i8,
+    pub preferred_cpu: Option<CpuId>,
+    pub last_cpu: CpuId,
+    pub runtime_ticks: u64,
+    pub runnable_avg: u64,
+    pub vruntime: u64,
+    pub sleep_credit: u64,
+    pub deficit: i64,
+    pub slice_ticks: u64,
+    pub voluntary_yields: u64,
+    pub full_slice_runs: u64,
+    pub sleep_started_at: Option<u64>,
+    pub queued: bool,
 }
 
 impl Task {
     pub fn new(id: usize, thread_id: usize, entry: extern "C" fn() -> !) -> Self {
+        Self::with_params(id, thread_id, entry, SchedParams::default())
+    }
+
+    pub fn with_params(
+        id: usize,
+        thread_id: usize,
+        entry: extern "C" fn() -> !,
+        params: SchedParams,
+    ) -> Self {
         let mut task = Self {
             id,
             thread_id,
-            rsp: 0,
             state: TaskState::Ready,
-            stack: alloc::vec![0; 4096 * 4],
+            stack: alloc::vec![0; KERNEL_STACK_SIZE],
+            saved_rsp: 0,
+            class_hint: params.class_hint,
+            class: params.class_hint.unwrap_or(TaskClass::Normal),
+            nice: params.nice.clamp(-20, 19),
+            preferred_cpu: params.preferred_cpu,
+            last_cpu: CpuId(0),
+            runtime_ticks: 0,
+            runnable_avg: 0,
+            vruntime: 0,
+            sleep_credit: 0,
+            deficit: 0,
+            slice_ticks: 0,
+            voluntary_yields: 0,
+            full_slice_runs: 0,
+            sleep_started_at: None,
+            queued: false,
         };
 
-        let stack_top = task.stack.as_ptr() as usize + task.stack.len();
-        let rsp = stack_top;
-        
-        println!("TASK: stack_base={:p}, stack_top={:p}, entry={:#x}", task.stack.as_ptr(), stack_top as *const u8, entry as usize);
-
-        // Push initial state onto stack as if it was saved by context_switch
-        // registers: r15, r14, r13, r12, rbp, rbx, rip
-        let _registers = [
-            0,              // r15
-            0,              // r14
-            0,              // r13
-            0,              // r12
-            0,              // rbp
-            0,              // rbx
-            entry as usize, // rip
-        ];
+        let stack_top = align_down(task.stack.as_ptr() as usize + task.stack.len(), 16);
+        // The initial task frame must look like a normal Win64 call site because the
+        // UEFI target uses the Microsoft x64 ABI, including 32 bytes of shadow space.
+        let call_like_rsp = stack_top - 40;
+        let context_rsp = call_like_rsp - size_of::<SavedTaskContext>();
+        let cs = usize::from(CS::get_reg().0);
+        let ss = usize::from(SS::get_reg().0);
 
         unsafe {
-            let stack_ptr = (rsp - 7 * core::mem::size_of::<usize>()) as *mut usize;
-            for i in 0..6 {
-                stack_ptr.add(i).write(0);
-            }
-            stack_ptr.add(6).write(entry as usize);
-            task.rsp = stack_ptr as usize;
+            (call_like_rsp as *mut usize).write(task_return_trampoline as *const () as usize);
+
+            let context = &mut *(context_rsp as *mut SavedTaskContext);
+            *context = SavedTaskContext {
+                rip: entry as usize,
+                cs,
+                rflags: 0x202,
+                rsp: call_like_rsp,
+                ss,
+                ..SavedTaskContext::default()
+            };
         }
 
+        task.saved_rsp = context_rsp;
         task
     }
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+struct CpuRunQueue {
+    id: CpuId,
+    llc_id: usize,
+    current_task: Option<usize>,
+    class_cursor: usize,
+    class_deficits: [i64; NUM_CLASSES],
+    queues: [VecDeque<usize>; NUM_CLASSES],
+}
+
+impl CpuRunQueue {
+    fn new(id: CpuId, llc_id: usize) -> Self {
+        Self {
+            id,
+            llc_id,
+            current_task: None,
+            class_cursor: 0,
+            class_deficits: [0; NUM_CLASSES],
+            queues: array::from_fn(|_| VecDeque::new()),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct LlcDomain {
+    id: usize,
+    cpus: Vec<CpuId>,
+}
+
 pub struct Scheduler {
-    pub tasks: VecDeque<Task>,
-    pub current_task: Option<Task>,
+    tasks: Vec<Task>,
+    task_lookup: BTreeMap<usize, usize>,
+    cpus: Vec<CpuRunQueue>,
+    #[allow(dead_code)]
+    llc_domains: Vec<LlcDomain>,
+    global_tick: u64,
+    started: bool,
 }
 
 impl Scheduler {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            tasks: VecDeque::new(),
-            current_task: None,
+            tasks: Vec::new(),
+            task_lookup: BTreeMap::new(),
+            cpus: vec![CpuRunQueue::new(CpuId(0), 0)],
+            llc_domains: vec![LlcDomain {
+                id: 0,
+                cpus: vec![CpuId(0)],
+            }],
+            global_tick: 0,
+            started: false,
         }
     }
 
-    pub fn add_task(&mut self, task: Task) {
-        self.tasks.push_back(task);
+    pub fn add_task(&mut self, mut task: Task) {
+        let task_id = task.id;
+        let cpu = self.select_cpu_for_task(&task);
+        task.last_cpu = cpu;
+        self.recompute_task_class(&mut task);
+        task.deficit = task_quantum(task.class, task.nice);
+
+        let index = self.tasks.len();
+        self.tasks.push(task);
+        self.task_lookup.insert(task_id, index);
+        self.enqueue_task(task_id);
     }
 
-    pub fn schedule(&mut self) {
-        if self.tasks.is_empty() {
+    pub fn start(&mut self) -> Option<usize> {
+        self.started = true;
+        self.pick_next_task(CpuId(0), None)
+    }
+
+    pub fn on_timer_tick(&mut self, current_rsp: usize) -> usize {
+        if !self.started {
+            return current_rsp;
+        }
+
+        self.global_tick = self.global_tick.wrapping_add(1);
+        if self.global_tick % 10 == 0 {
+            println!("TICK");
+        }
+
+        let cpu = CpuId(0);
+        let prev = self.cpus[cpu.0].current_task;
+        if let Some(task_id) = prev {
+            self.account_running_task(cpu, task_id, current_rsp);
+        }
+
+        self.pick_next_task(cpu, prev).unwrap_or(current_rsp)
+    }
+
+    pub fn request_yield(&mut self, cpu: CpuId) {
+        let Some(task_id) = self.cpus[cpu.0].current_task else {
+            return;
+        };
+
+        let index = self.task_index(task_id);
+        let task = &mut self.tasks[index];
+        task.voluntary_yields = task.voluntary_yields.saturating_add(1);
+        task.slice_ticks = 0;
+        task.deficit = 0;
+    }
+
+    pub fn block_current(&mut self, cpu: CpuId) {
+        let Some(task_id) = self.cpus[cpu.0].current_task else {
+            return;
+        };
+
+        let index = self.task_index(task_id);
+        let task = &mut self.tasks[index];
+        task.state = TaskState::Blocked;
+        task.queued = false;
+        task.slice_ticks = 0;
+        task.deficit = 0;
+        task.sleep_started_at = Some(self.global_tick);
+    }
+
+    pub fn wake_task(&mut self, task_id: usize) {
+        let index = self.task_index(task_id);
+        let task = &mut self.tasks[index];
+        if task.state != TaskState::Blocked {
             return;
         }
 
-        // Get the next task
-        let mut next_task = self.tasks.pop_front().unwrap();
-        next_task.state = TaskState::Running;
-        let next_rsp = next_task.rsp;
+        let slept = task
+            .sleep_started_at
+            .take()
+            .map(|start| self.global_tick.saturating_sub(start))
+            .unwrap_or(0);
 
-        // Save old task and get its RSP pointer
-        static mut DUMMY_RSP: usize = 0;
-        let old_rsp_ptr: *mut usize = if let Some(mut prev) = self.current_task.take() {
-            prev.state = TaskState::Ready;
-            self.tasks.push_back(prev);
-            // The task is now at the back of the queue. We need a pointer to its rsp.
-            &mut self.tasks.back_mut().unwrap().rsp
-        } else {
-            // First run
-            unsafe { &raw mut DUMMY_RSP }
+        task.sleep_credit = min(
+            MAX_SLEEP_CREDIT,
+            task.sleep_credit
+                .saturating_add(slept.saturating_mul(WAKE_CREDIT_PER_TICK)),
+        );
+        task.state = TaskState::Ready;
+        task.deficit = task_quantum(task.class, task.nice);
+        self.enqueue_task(task_id);
+    }
+
+    pub fn exit_current(&mut self, cpu: CpuId) -> Option<usize> {
+        if let Some(task_id) = self.cpus[cpu.0].current_task.take() {
+            let index = self.task_index(task_id);
+            let task = &mut self.tasks[index];
+            task.state = TaskState::Exited;
+            task.queued = false;
+        }
+
+        self.pick_next_task(cpu, None)
+    }
+
+    pub fn timer_handler_addr(&self) -> usize {
+        timer_interrupt_entry as *const () as usize
+    }
+
+    pub fn select_cpu(&self, task_id: usize) -> CpuId {
+        let task = self.task(task_id);
+        self.select_cpu_for_task(task)
+    }
+
+    fn select_cpu_for_task(&self, task: &Task) -> CpuId {
+        if self.cpu_is_idle(task.last_cpu) {
+            return task.last_cpu;
+        }
+
+        if let Some(preferred_cpu) = task.preferred_cpu {
+            if preferred_cpu.0 < self.cpus.len() && self.cpu_is_idle(preferred_cpu) {
+                return preferred_cpu;
+            }
+        }
+
+        CpuId(0)
+    }
+
+    fn cpu_is_idle(&self, cpu: CpuId) -> bool {
+        let rq = &self.cpus[cpu.0];
+        rq.current_task.is_none() && rq.queues.iter().all(VecDeque::is_empty)
+    }
+
+    fn task_index(&self, task_id: usize) -> usize {
+        *self
+            .task_lookup
+            .get(&task_id)
+            .unwrap_or_else(|| panic!("unknown task id {}", task_id))
+    }
+
+    fn task(&self, task_id: usize) -> &Task {
+        &self.tasks[self.task_index(task_id)]
+    }
+
+    fn task_mut(&mut self, task_id: usize) -> &mut Task {
+        let index = self.task_index(task_id);
+        &mut self.tasks[index]
+    }
+
+    fn account_running_task(&mut self, cpu: CpuId, task_id: usize, current_rsp: usize) {
+        let index = self.task_index(task_id);
+        let old_class = self.tasks[index].class;
+        let task_quantum = task_quantum(old_class, self.tasks[index].nice) as u64;
+        {
+            let task = &mut self.tasks[index];
+            task.saved_rsp = current_rsp;
+            task.runtime_ticks = task.runtime_ticks.saturating_add(1);
+            task.slice_ticks = task.slice_ticks.saturating_add(1);
+            task.runnable_avg = ((task.runnable_avg * 7) + RUNNABLE_SCALE) / 8;
+            task.vruntime = task
+                .vruntime
+                .saturating_add(vruntime_delta(task.class, task.nice));
+            task.sleep_credit = task.sleep_credit.saturating_sub(1);
+
+            if task.slice_ticks >= task_quantum {
+                task.full_slice_runs = task.full_slice_runs.saturating_add(1);
+                task.slice_ticks = 0;
+            }
+
+            if task.state == TaskState::Running {
+                task.state = TaskState::Ready;
+            }
+        }
+
+        self.recompute_task_class_by_id(task_id);
+
+        if self.task(task_id).state == TaskState::Ready {
+            self.enqueue_task(task_id);
+        }
+
+        self.cpus[cpu.0].current_task = None;
+    }
+
+    fn recompute_task_class_by_id(&mut self, task_id: usize) {
+        let index = self.task_index(task_id);
+        let mut class = self.tasks[index].class_hint.unwrap_or(TaskClass::Normal);
+
+        if self.tasks[index].class_hint.is_none() {
+            if self.tasks[index].nice >= 10 {
+                class = TaskClass::Background;
+            } else if self.tasks[index].runnable_avg >= HOG_UTIL_THRESHOLD
+                && self.tasks[index].full_slice_runs >= HOG_SLICE_THRESHOLD
+            {
+                class = TaskClass::Hog;
+            } else {
+                class = TaskClass::Normal;
+            }
+        }
+
+        self.tasks[index].class = class;
+    }
+
+    fn recompute_task_class(&self, task: &mut Task) {
+        task.class = task.class_hint.unwrap_or_else(|| {
+            if task.nice >= 10 {
+                TaskClass::Background
+            } else {
+                TaskClass::Normal
+            }
+        });
+    }
+
+    fn enqueue_task(&mut self, task_id: usize) {
+        let (cpu, class, should_enqueue) = {
+            let task = self.task(task_id);
+            (
+                task.last_cpu,
+                task.class,
+                task.state == TaskState::Ready && !task.queued,
+            )
         };
-        
-        // Make next_task the current one
-        self.current_task = Some(next_task);
 
-        unsafe {
-            // Debug: print the stack we're about to switch to
-            let ptr = next_rsp as *const usize;
-            println!("SWITCH: next_rsp={:#x}, rip={:#x}, rbx={:#x}", 
-                next_rsp, 
-                ptr.add(6).read(),
-                ptr.add(5).read()
-            );
+        if !should_enqueue {
+            return;
+        }
 
-            x86_64::instructions::interrupts::without_interrupts(|| {
-                context_switch(old_rsp_ptr, next_rsp);
-            });
+        self.cpus[cpu.0].queues[class.index()].push_back(task_id);
+        self.task_mut(task_id).queued = true;
+    }
+
+    fn pick_next_task(&mut self, cpu: CpuId, previous: Option<usize>) -> Option<usize> {
+        let cpu_idx = cpu.0;
+        for _ in 0..2 {
+            for offset in 0..NUM_CLASSES {
+                let class_idx = (self.cpus[cpu_idx].class_cursor + offset) % NUM_CLASSES;
+                if self.cpus[cpu_idx].class_deficits[class_idx] <= 0 {
+                    continue;
+                }
+
+                let class = TaskClass::from_index(class_idx);
+                if let Some(task_id) = self.pick_task_from_class(cpu, class) {
+                    self.cpus[cpu_idx].class_cursor = (class_idx + 1) % NUM_CLASSES;
+                    self.cpus[cpu_idx].class_deficits[class_idx] -= 1;
+
+                    let next_rsp = {
+                        let task = self.task_mut(task_id);
+                        task.state = TaskState::Running;
+                        task.last_cpu = cpu;
+                        if Some(task_id) != previous {
+                            task.slice_ticks = 0;
+                        }
+                        if task.deficit <= 0 {
+                            task.deficit = task_quantum(task.class, task.nice);
+                        }
+                        task.deficit -= 1;
+                        task.saved_rsp
+                    };
+
+                    self.cpus[cpu_idx].current_task = Some(task_id);
+                    return Some(next_rsp);
+                }
+            }
+
+            self.refill_class_deficits(cpu);
+        }
+
+        if let Some(task_id) = previous {
+            let next_rsp = {
+                let task = self.task_mut(task_id);
+                if task.state == TaskState::Ready || task.state == TaskState::Running {
+                    task.state = TaskState::Running;
+                    Some(task.saved_rsp)
+                } else {
+                    None
+                }
+            };
+
+            if next_rsp.is_some() {
+                self.cpus[cpu_idx].current_task = Some(task_id);
+            }
+            return next_rsp;
+        }
+
+        None
+    }
+
+    fn refill_class_deficits(&mut self, cpu: CpuId) {
+        let cpu_idx = cpu.0;
+        for class_idx in 0..NUM_CLASSES {
+            if self.has_ready_task_in_class(cpu, TaskClass::from_index(class_idx)) {
+                let quantum = CLASS_QUANTA[class_idx];
+                let deficit = &mut self.cpus[cpu_idx].class_deficits[class_idx];
+                *deficit = (*deficit).max(0).saturating_add(quantum).min(quantum * 2);
+            }
+        }
+    }
+
+    fn has_ready_task_in_class(&self, cpu: CpuId, class: TaskClass) -> bool {
+        self.cpus[cpu.0].queues[class.index()]
+            .iter()
+            .any(|task_id| self.task(*task_id).state == TaskState::Ready)
+    }
+
+    fn pick_task_from_class(&mut self, cpu: CpuId, class: TaskClass) -> Option<usize> {
+        for pass in 0..2 {
+            let mut best_task_id = None;
+            let mut best_vruntime = u64::MAX;
+            let queue_snapshot: Vec<usize> =
+                self.cpus[cpu.0].queues[class.index()].iter().copied().collect();
+
+            for task_id in queue_snapshot {
+                let task = self.task(task_id);
+                if task.state != TaskState::Ready || task.deficit <= 0 {
+                    continue;
+                }
+
+                let effective_vruntime = task.vruntime.saturating_sub(task.sleep_credit);
+                if effective_vruntime < best_vruntime {
+                    best_vruntime = effective_vruntime;
+                    best_task_id = Some(task_id);
+                }
+            }
+
+            if let Some(task_id) = best_task_id {
+                let position = self.cpus[cpu.0].queues[class.index()]
+                    .iter()
+                    .position(|candidate| *candidate == task_id)
+                    .unwrap();
+                self.cpus[cpu.0].queues[class.index()].remove(position);
+                self.task_mut(task_id).queued = false;
+                return Some(task_id);
+            }
+
+            if pass == 0 {
+                self.refill_task_deficits(cpu, class);
+            }
+        }
+
+        None
+    }
+
+    fn refill_task_deficits(&mut self, cpu: CpuId, class: TaskClass) {
+        let queue_snapshot: Vec<usize> = self.cpus[cpu.0].queues[class.index()]
+            .iter()
+            .copied()
+            .collect();
+
+        for task_id in queue_snapshot {
+            let task = self.task_mut(task_id);
+            if task.state != TaskState::Ready {
+                continue;
+            }
+
+            let quantum = task_quantum(class, task.nice);
+            task.deficit = task.deficit.max(0).saturating_add(quantum).min(quantum * 2);
         }
     }
 }
 
-pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+fn nice_weight(nice: i8) -> u64 {
+    u64::from((40 - (nice.clamp(-20, 19) as i32 + 20)).max(1) as u32)
+}
+
+fn task_quantum(class: TaskClass, nice: i8) -> i64 {
+    let base = CLASS_QUANTA[class.index()];
+    let weight = nice_weight(nice) as i64;
+    ((base * weight) / 20).max(1)
+}
+
+fn vruntime_delta(class: TaskClass, nice: i8) -> u64 {
+    let weight = CLASS_WEIGHTS[class.index()].saturating_mul(nice_weight(nice)).max(1);
+    1024 / weight
+}
+
+const fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "sysv64" fn scheduler_timer_tick(current_ctx: *mut SavedTaskContext) -> *const SavedTaskContext {
+    let next_ctx = {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.on_timer_tick(current_ctx as usize)
+    };
+
+    apic::complete_interrupt();
+    next_ctx as *const SavedTaskContext
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn task_return_trampoline() -> ! {
+    println!("TASK: returned unexpectedly, tearing it down");
+    on_task_exit()
+}
+
+pub fn start() -> ! {
+    let next_ctx = {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.start()
+    }
+    .expect("scheduler started without a runnable task");
+
+    unsafe { restore_task_context(next_ctx as *const SavedTaskContext) }
+}
+
+pub fn timer_handler_addr() -> usize {
+    SCHEDULER.lock().timer_handler_addr()
+}
+
+pub fn yield_current() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().request_yield(CpuId(0));
+    });
+}
+
+pub fn block_current() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().block_current(CpuId(0));
+    });
+}
+
+pub fn wake_task(task_id: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().wake_task(task_id);
+    });
+}
+
+pub fn on_task_exit() -> ! {
+    x86_64::instructions::interrupts::disable();
+
+    let next_ctx = {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.exit_current(CpuId(0))
+    };
+
+    if let Some(next_ctx) = next_ctx {
+        unsafe { restore_task_context(next_ctx as *const SavedTaskContext) }
+    }
+
+    loop {
+        unsafe {
+            asm!("hlt");
+        }
+    }
+}
+
+pub static SCHEDULER: Lazy<Mutex<Scheduler>> = Lazy::new(|| Mutex::new(Scheduler::new()));

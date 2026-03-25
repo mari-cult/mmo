@@ -26,11 +26,7 @@ pub unsafe extern "C" fn sys_write(fd: usize, buf: *const u8, len: usize) -> usi
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_exit(code: usize) -> ! {
     println!("SYSCALL: exit(code={})", code);
-    loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
+    crate::process::on_task_exit()
 }
 
 #[unsafe(naked)]
