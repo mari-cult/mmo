@@ -684,6 +684,18 @@ const fn align_down(value: usize, align: usize) -> usize {
 pub extern "sysv64" fn scheduler_timer_tick(
     current_ctx: *mut SavedTaskContext,
 ) -> *const SavedTaskContext {
+    if current_ctx.is_null() {
+        apic::complete_interrupt();
+        return core::ptr::null();
+    }
+
+    let cs = unsafe { (*current_ctx).cs };
+    let cpl = cs & 0x3;
+    if cpl == 0 {
+        apic::complete_interrupt();
+        return current_ctx;
+    }
+
     let next_ctx = {
         let mut scheduler = SCHEDULER.lock();
         scheduler.on_timer_tick(current_ctx as usize)

@@ -8,7 +8,7 @@ use spin::{Lazy, Mutex};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper as _, OffsetPageTable, Page, PageSize, PageTableFlags, PhysFrame,
     Size4KiB,
-    mapper::{MapToError, UnmapError},
+    mapper::{FlagUpdateError, MapToError, UnmapError},
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -166,6 +166,18 @@ pub fn map_existing_page(
     })
 }
 
+pub fn update_page_flags(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<(), VmError> {
+    with_runtime(|mapper, _frame_allocator| {
+        unsafe {
+            mapper
+                .update_flags(page, flags)
+                .map_err(flag_update_error_to_vm)?
+                .flush();
+        }
+        Ok(())
+    })
+}
+
 pub fn unmap_page(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, VmError> {
     with_runtime(|mapper, _frame_allocator| {
         let (frame, flush) = mapper.unmap(page).map_err(unmap_error_to_vm)?;
@@ -229,6 +241,13 @@ fn unmap_error_to_vm(err: UnmapError) -> VmError {
         UnmapError::ParentEntryHugePage => VmError::ParentEntryHugePage,
         UnmapError::PageNotMapped => VmError::PageNotMapped,
         UnmapError::InvalidFrameAddress(_) => VmError::PageNotMapped,
+    }
+}
+
+fn flag_update_error_to_vm(err: FlagUpdateError) -> VmError {
+    match err {
+        FlagUpdateError::ParentEntryHugePage => VmError::ParentEntryHugePage,
+        FlagUpdateError::PageNotMapped => VmError::PageNotMapped,
     }
 }
 

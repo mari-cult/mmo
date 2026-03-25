@@ -1,12 +1,13 @@
 extern crate alloc;
 
 use crate::vfs;
-use crate::{allocator, gdt, process};
+use crate::{allocator, gdt, println, process};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use goblin::elf::Elf;
+use goblin::elf::dynamic::{DT_NEEDED, DT_NULL, DT_STRTAB, Dyn};
 use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
 use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
@@ -15,10 +16,11 @@ use x86_64::structures::paging::{Page, PageSize, PageTableFlags, Size4KiB};
 
 const PAGE_SIZE: u64 = Size4KiB::SIZE;
 const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
-const USER_STACK_PAGES: u64 = 16;
+const USER_STACK_PAGES: u64 = 64;
 const USER_MAIN_BASE: u64 = 0x0000_0000_4000_0000;
 const USER_INTERP_BASE: u64 = 0x0000_0000_7000_0000;
-const USER_MMAP_BASE: u64 = 0x0000_0000_5000_0000;
+const USER_BRK_BASE: u64 = 0x0000_0000_5000_0000;
+const USER_MMAP_BASE: u64 = 0x0000_0001_0000_0000;
 
 const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
@@ -71,7 +73,7 @@ impl Default for UserProcess {
             pid: 1,
             ppid: 0,
             cwd: "/".to_string(),
-            brk: USER_MMAP_BASE,
+            brk: USER_BRK_BASE,
             tid_addr: 0,
             init_path: None,
             fs_base: 0,
@@ -114,6 +116,28 @@ pub fn bootstrap_init(path: &str) -> Result<(), UserError> {
     let mut p = CURRENT.lock();
     p.init_path = Some(path.to_string());
     Ok(())
+}
+
+pub fn debug_file_elf(path: &str) {
+    let Ok(bytes) = vfs::read_all(path) else {
+        println!("USER-ELF file path={} read failed", path);
+        return;
+    };
+    let Ok(elf) = validate_elf(&bytes) else {
+        println!("USER-ELF file path={} parse failed", path);
+        return;
+    };
+    let needed = elf.libraries.clone();
+    println!(
+        "USER-ELF file path={} entry={:#x} interp={:?} needed_count={}",
+        path,
+        elf.entry,
+        elf.interpreter,
+        needed.len()
+    );
+    for lib in needed {
+        println!("USER-ELF file needed={}", lib);
+    }
 }
 
 fn validate_elf(bytes: &[u8]) -> Result<Elf<'_>, UserError> {
@@ -171,20 +195,17 @@ pub fn arch_prctl(code: usize, addr: u64) -> Result<u64, UserError> {
 }
 
 pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, UserError> {
-    let bash_argv = [
-        path,
-        "--noprofile",
-        "--norc",
-        "-c",
-        "echo gentoo-userspace-online; while :; do :; done",
-    ];
+    let bash_argv = [path, "--noediting"];
+    let ldso_argv = [path, "/usr/bin/clear"];
     let default_argv = [path];
     let argv = if path == "/usr/bin/bash" {
         &bash_argv[..]
+    } else if path == "/usr/lib/ld-musl-x86_64.so.1" || path == "/lib/ld-musl-x86_64.so.1" {
+        &ldso_argv[..]
     } else {
         &default_argv[..]
     };
-    let envp = ["HOME=/", "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "TERM=linux"];
+    let envp = ["HOME=/", "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "TERM=dumb"];
     load_task_from_elf(task_id, path, &argv, &envp)
 }
 
@@ -223,10 +244,18 @@ pub fn mmap(
         let mut page_off = 0u64;
         while remaining != 0 {
             let page_len = remaining.min(PAGE_SIZE);
-            let mut buf = vec![0u8; page_len as usize];
-            let n = vfs::pread(fd, offset + page_off, &mut buf).map_err(|_| UserError::Vfs)?;
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut((start + page_off) as *mut u8, page_len as usize)
+            };
+            let n = vfs::pread(fd, offset + page_off, dst).map_err(|_| UserError::Vfs)?;
             unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr(), (start + page_off) as *mut u8, n);
+                if n < page_len as usize {
+                    core::ptr::write_bytes(
+                        (start + page_off + n as u64) as *mut u8,
+                        0,
+                        page_len as usize - n,
+                    );
+                }
             }
             remaining -= page_len;
             page_off += page_len;
@@ -272,16 +301,15 @@ fn load_task_from_elf(
         0
     };
     let main = load_elf_image(&bytes, &elf, main_base)?;
+    debug_loaded_image("main", path, &elf, &main);
 
     let interp_path = elf.interpreter.map(str::to_string);
     let interp = if let Some(ref interp_path) = interp_path {
         let interp_bytes = vfs::read_all(interp_path).map_err(|_| UserError::Vfs)?;
         let interp_elf = validate_elf(&interp_bytes)?;
-        Some(load_elf_image(
-            &interp_bytes,
-            &interp_elf,
-            USER_INTERP_BASE,
-        )?)
+        let image = load_elf_image(&interp_bytes, &interp_elf, USER_INTERP_BASE)?;
+        debug_loaded_image("interp", interp_path, &interp_elf, &image);
+        Some(image)
     } else {
         None
     };
@@ -293,6 +321,16 @@ fn load_task_from_elf(
         PROT_READ | PROT_WRITE,
     )?;
     let stack = build_initial_stack(USER_STACK_TOP, path, argv, envp, &main, interp.as_ref())?;
+    if path == "/usr/bin/bash" {
+        let q0 = unsafe { *(stack.rsp as *const u64) };
+        let q1 = unsafe { *((stack.rsp + 8) as *const u64) };
+        let q2 = unsafe { *((stack.rsp + 16) as *const u64) };
+        let q3 = unsafe { *((stack.rsp + 24) as *const u64) };
+        println!(
+            "USER-STACK rsp={:#x} argc={} argv_ptr={:#x} envp_ptr={:#x} q0={:#x} q1={:#x} q2={:#x} q3={:#x}",
+            stack.rsp, stack.argc, stack.argv_ptr, stack.envp_ptr, q0, q1, q2, q3
+        );
+    }
 
     let entry = interp
         .as_ref()
@@ -303,19 +341,19 @@ fn load_task_from_elf(
         let mut state = CURRENT.lock();
         state.init_path = Some(path.to_string());
         state.task_id = Some(task_id);
-        state.brk = align_up(main.brk_end.max(USER_MMAP_BASE), PAGE_SIZE);
-        state.next_mmap_base = state.brk.saturating_add(PAGE_SIZE);
+        state.brk = align_up(main.brk_end.max(USER_BRK_BASE), PAGE_SIZE);
+        state.next_mmap_base = USER_MMAP_BASE.max(state.brk.saturating_add(PAGE_SIZE));
     }
 
     let ctx = process::SavedTaskContext {
         rip: entry as usize,
         cs: usize::from(gdt::user_code_selector().0),
-        rflags: 0x2,
+        rflags: 0x202,
         rsp: stack.rsp as usize,
         ss: usize::from(gdt::user_data_selector().0),
-        rdi: stack.argc,
-        rsi: stack.argv_ptr as usize,
-        rdx: stack.envp_ptr as usize,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
         ..process::SavedTaskContext::default()
     };
 
@@ -338,17 +376,22 @@ fn load_elf_image(bytes: &[u8], elf: &Elf<'_>, base: u64) -> Result<LoadedElf, U
         let seg_len = seg_end.saturating_sub(seg_start);
         let prot = ph_to_prot(ph.p_flags);
         map_region(seg_start, seg_len, prot)?;
-        let file_start = usize::try_from(ph.p_offset).map_err(|_| UserError::InvalidElf)?;
+        let file_page_start = usize::try_from(align_down(ph.p_offset, PAGE_SIZE))
+            .map_err(|_| UserError::InvalidElf)?;
         let file_end =
             usize::try_from(ph.p_offset + ph.p_filesz).map_err(|_| UserError::InvalidElf)?;
         if file_end > bytes.len() {
             return Err(UserError::InvalidElf);
         }
+        let page_delta = usize::try_from(ph.p_offset - align_down(ph.p_offset, PAGE_SIZE))
+            .map_err(|_| UserError::InvalidElf)?;
         unsafe {
             core::ptr::copy_nonoverlapping(
-                bytes[file_start..file_end].as_ptr(),
-                (base + ph.p_vaddr) as *mut u8,
-                usize::try_from(ph.p_filesz).map_err(|_| UserError::InvalidElf)?,
+                bytes[file_page_start..file_end].as_ptr(),
+                seg_start as *mut u8,
+                usize::try_from(ph.p_filesz)
+                    .map_err(|_| UserError::InvalidElf)?
+                    .saturating_add(page_delta),
             );
             if ph.p_memsz > ph.p_filesz {
                 core::ptr::write_bytes(
@@ -381,6 +424,69 @@ fn load_elf_image(bytes: &[u8], elf: &Elf<'_>, base: u64) -> Result<LoadedElf, U
         load_base: base,
         brk_end: align_up(brk_end, PAGE_SIZE),
     })
+}
+
+fn debug_loaded_image(label: &str, path: &str, elf: &Elf<'_>, loaded: &LoadedElf) {
+    let mut strtab_addr = 0u64;
+    let mut needed_offsets = Vec::new();
+    for ph in &elf.program_headers {
+        if ph.p_type != goblin::elf::program_header::PT_DYNAMIC {
+            continue;
+        }
+        let dyn_count = (ph.p_memsz as usize) / core::mem::size_of::<Dyn>();
+        let dyns = unsafe {
+            core::slice::from_raw_parts((loaded.load_base + ph.p_vaddr) as *const Dyn, dyn_count)
+        };
+        for dynent in dyns {
+            match dynent.d_tag {
+                tag if tag == DT_NULL => break,
+                tag if tag == DT_STRTAB => strtab_addr = relocate_image_addr(dynent.d_val, loaded),
+                tag if tag == DT_NEEDED => needed_offsets.push(dynent.d_val as usize),
+                _ => {}
+            }
+        }
+    }
+
+    println!(
+        "USER-ELF {} path={} base={:#x} entry={:#x} phdr={:#x} strtab={:#x} needed_count={}",
+        label,
+        path,
+        loaded.load_base,
+        loaded.entry,
+        loaded.phdr_addr,
+        strtab_addr,
+        needed_offsets.len()
+    );
+
+    for off in needed_offsets {
+        let name =
+            read_c_string((strtab_addr + off as u64) as *const u8, 128).unwrap_or("<invalid>");
+        println!("USER-ELF {} needed={}", label, name);
+    }
+}
+
+fn relocate_image_addr(addr: u64, loaded: &LoadedElf) -> u64 {
+    if addr >= loaded.load_base {
+        addr
+    } else {
+        loaded.load_base + addr
+    }
+}
+
+fn read_c_string(ptr: *const u8, max_len: usize) -> Option<&'static str> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < max_len {
+        let b = unsafe { ptr.add(len).read_volatile() };
+        if b == 0 {
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            return core::str::from_utf8(bytes).ok();
+        }
+        len += 1;
+    }
+    None
 }
 
 fn build_initial_stack(
@@ -486,11 +592,12 @@ fn map_region(start: u64, len: u64, prot: i32) -> Result<(), UserError> {
     for idx in 0..page_count {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(start + idx * PAGE_SIZE));
         match allocator::allocate_and_map_page(page, flags) {
-            Ok(_) => {}
-            Err(allocator::VmError::PageAlreadyMapped) => {}
+            Ok(_) => allocator::zero_page(page),
+            Err(allocator::VmError::PageAlreadyMapped) => {
+                allocator::update_page_flags(page, flags).map_err(|_| UserError::Vm)?
+            }
             Err(_) => return Err(UserError::Vm),
         }
-        allocator::zero_page(page);
     }
     Ok(())
 }
