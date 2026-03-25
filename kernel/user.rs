@@ -101,6 +101,13 @@ struct LoadedElf {
     brk_end: u64,
 }
 
+struct InitialStack {
+    rsp: u64,
+    argc: usize,
+    argv_ptr: u64,
+    envp_ptr: u64,
+}
+
 pub fn bootstrap_init(path: &str) -> Result<(), UserError> {
     let bytes = vfs::read_all(path).map_err(|_| UserError::Vfs)?;
     validate_elf(&bytes)?;
@@ -164,13 +171,19 @@ pub fn arch_prctl(code: usize, addr: u64) -> Result<u64, UserError> {
 }
 
 pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, UserError> {
-    let argv = [
+    let bash_argv = [
         path,
         "--noprofile",
         "--norc",
         "-c",
         "echo gentoo-userspace-online; while :; do :; done",
     ];
+    let default_argv = [path];
+    let argv = if path == "/usr/bin/bash" {
+        &bash_argv[..]
+    } else {
+        &default_argv[..]
+    };
     let envp = ["HOME=/", "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "TERM=linux"];
     load_task_from_elf(task_id, path, &argv, &envp)
 }
@@ -279,7 +292,7 @@ fn load_task_from_elf(
         USER_STACK_PAGES * PAGE_SIZE,
         PROT_READ | PROT_WRITE,
     )?;
-    let rsp = build_initial_stack(USER_STACK_TOP, path, argv, envp, &main, interp.as_ref())?;
+    let stack = build_initial_stack(USER_STACK_TOP, path, argv, envp, &main, interp.as_ref())?;
 
     let entry = interp
         .as_ref()
@@ -298,8 +311,11 @@ fn load_task_from_elf(
         rip: entry as usize,
         cs: usize::from(gdt::user_code_selector().0),
         rflags: 0x2,
-        rsp: rsp as usize,
+        rsp: stack.rsp as usize,
         ss: usize::from(gdt::user_data_selector().0),
+        rdi: stack.argc,
+        rsi: stack.argv_ptr as usize,
+        rdx: stack.envp_ptr as usize,
         ..process::SavedTaskContext::default()
     };
 
@@ -312,7 +328,6 @@ fn load_task_from_elf(
 }
 
 fn load_elf_image(bytes: &[u8], elf: &Elf<'_>, base: u64) -> Result<LoadedElf, UserError> {
-    let mut mapped_pages = BTreeMap::new();
     let mut brk_end = 0u64;
     for ph in &elf.program_headers {
         if ph.p_type != PT_LOAD {
@@ -344,7 +359,6 @@ fn load_elf_image(bytes: &[u8], elf: &Elf<'_>, base: u64) -> Result<LoadedElf, U
             }
         }
         brk_end = brk_end.max(base + ph.p_vaddr + ph.p_memsz);
-        mapped_pages.insert(seg_start, seg_len);
     }
 
     let mut phdr_addr = 0u64;
@@ -376,7 +390,7 @@ fn build_initial_stack(
     envp: &[&str],
     main: &LoadedElf,
     interp: Option<&LoadedElf>,
-) -> Result<u64, UserError> {
+) -> Result<InitialStack, UserError> {
     let mut rsp = stack_top;
     let mut argv_ptrs = Vec::with_capacity(argv.len());
     let mut env_ptrs = Vec::with_capacity(envp.len());
@@ -408,11 +422,10 @@ fn build_initial_stack(
         (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),
         (AT_EXECFN, execfn_ptr),
-        (AT_NULL, 0),
     ];
 
     push_usize(&mut rsp, 0);
-    push_usize(&mut rsp, 0);
+    push_usize(&mut rsp, AT_NULL);
     for (key, value) in auxv.iter().rev() {
         push_usize(&mut rsp, *value as usize);
         push_usize(&mut rsp, *key);
@@ -421,12 +434,19 @@ fn build_initial_stack(
     for ptr in env_ptrs.iter().rev() {
         push_usize(&mut rsp, *ptr as usize);
     }
+    let envp_ptr = rsp;
     push_usize(&mut rsp, 0);
     for ptr in argv_ptrs.iter().rev() {
         push_usize(&mut rsp, *ptr as usize);
     }
+    let argv_ptr = rsp;
     push_usize(&mut rsp, argv.len());
-    Ok(rsp)
+    Ok(InitialStack {
+        rsp,
+        argc: argv.len(),
+        argv_ptr,
+        envp_ptr,
+    })
 }
 
 fn push_bytes(rsp: &mut u64, bytes: &[u8]) -> Result<u64, UserError> {

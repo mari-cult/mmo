@@ -199,6 +199,7 @@ pub unsafe extern "C" fn syscall_handler() -> ! {
         "mov %rdx, %r14",
         "mov %r10, %r15",
         "mov %r8, %rbx",
+        "mov %r9, %rbp",
         "mov %rax, %rdi",
         "mov %r12, %rsi",
         "mov %r13, %rdx",
@@ -212,7 +213,7 @@ pub unsafe extern "C" fn syscall_handler() -> ! {
         "mov %r14, 24(%rsp)",
         "mov %r15, 32(%rsp)",
         "mov %rbx, 40(%rsp)",
-        "mov %r9, 48(%rsp)",
+        "mov %rbp, 48(%rsp)",
         "mov %rsp, %rdi",
         "call syscall_dispatch",
         "add $56, %rsp",
@@ -329,8 +330,11 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
     let a4 = args.a4;
     let a5 = args.a5;
     let trace_idx = SYSCALL_TRACE_COUNT.fetch_add(1, Ordering::SeqCst);
-    if trace_idx < 16 {
-        println!("SYSCALL: nr={} a0={:#x} a1={:#x} a2={:#x}", nr, a0, a1, a2);
+    if trace_idx < 64 && nr != SYS_WRITEV {
+        println!(
+            "SYSCALL: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+            nr, a0, a1, a2, a3, a4, a5
+        );
     }
     match nr {
         SYS_READ => {
@@ -344,9 +348,20 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 return 0;
             }
             let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+            let path = if fd >= 3 { vfs::path_of_fd(fd).ok() } else { None };
             match vfs::read(fd, out) {
-                Ok(n) => n,
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(n) => {
+                    if let Some(path) = path.as_deref() {
+                        println!("READ fd={} path={} len={} -> {}", fd, path, len, n);
+                    }
+                    n
+                }
+                Err(e) => {
+                    if let Some(path) = path.as_deref() {
+                        println!("READ err fd={} path={} len={} err={:?}", fd, path, len, e);
+                    }
+                    neg_errno(from_vfs_err(e))
+                }
             }
         }
         SYS_READV => {
@@ -427,32 +442,71 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
             }
             total
         }
-        SYS_CLOSE => match vfs::close(a0 as i32) {
-            Ok(()) => 0,
-            Err(e) => neg_errno(from_vfs_err(e)),
-        },
+        SYS_CLOSE => {
+            let fd = a0 as i32;
+            let path = if fd >= 3 { vfs::path_of_fd(fd).ok() } else { None };
+            match vfs::close(fd) {
+                Ok(()) => {
+                    if let Some(path) = path.as_deref() {
+                        println!("CLOSE fd={} path={}", fd, path);
+                    }
+                    0
+                }
+                Err(e) => {
+                    if let Some(path) = path.as_deref() {
+                        println!("CLOSE err fd={} path={} err={:?}", fd, path, e);
+                    }
+                    neg_errno(from_vfs_err(e))
+                }
+            }
+        }
         SYS_STAT => {
             let path = match read_cstr(a0 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("STAT read_cstr err ptr={:#x} err={}", a0, e);
+                    return neg_errno(e);
+                }
             };
+            println!("STAT path={}", path);
             match vfs::stat_path(&path, true) {
-                Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(st) => {
+                    println!("STAT ok path={} size={}", path, st.size);
+                    write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size)
+                }
+                Err(e) => {
+                    println!("STAT err path={} err={:?}", path, e);
+                    neg_errno(from_vfs_err(e))
+                }
             }
         }
         SYS_FSTAT => match vfs::fstat(a0 as i32) {
-            Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
+            Ok(st) => {
+                if let Ok(path) = vfs::path_of_fd(a0 as i32) {
+                    println!("FSTAT fd={} path={} size={}", a0 as i32, path, st.size);
+                }
+                write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size)
+            }
             Err(e) => neg_errno(from_vfs_err(e)),
         },
         SYS_LSTAT => {
             let path = match read_cstr(a0 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("LSTAT read_cstr err ptr={:#x} err={}", a0, e);
+                    return neg_errno(e);
+                }
             };
+            println!("LSTAT path={}", path);
             match vfs::stat_path(&path, false) {
-                Ok(st) => write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size),
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(st) => {
+                    println!("LSTAT ok path={} size={}", path, st.size);
+                    write_stat(a1 as *mut LinuxStat, st.ino, st.mode, st.size)
+                }
+                Err(e) => {
+                    println!("LSTAT err path={} err={:?}", path, e);
+                    neg_errno(from_vfs_err(e))
+                }
             }
         }
         SYS_FCNTL => {
@@ -504,9 +558,26 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 return neg_errno(EFAULT);
             }
             let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+            let path = if fd >= 3 { vfs::path_of_fd(fd).ok() } else { None };
             match vfs::pread(fd, offset, out) {
-                Ok(n) => n,
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(n) => {
+                    if let Some(path) = path.as_deref() {
+                        println!(
+                            "PREAD64 fd={} path={} off={:#x} len={} -> {}",
+                            fd, path, offset, len, n
+                        );
+                    }
+                    n
+                }
+                Err(e) => {
+                    if let Some(path) = path.as_deref() {
+                        println!(
+                            "PREAD64 err fd={} path={} off={:#x} len={} err={:?}",
+                            fd, path, offset, len, e
+                        );
+                    }
+                    neg_errno(from_vfs_err(e))
+                }
             }
         }
         SYS_LSEEK => match vfs::lseek(a0 as i32, a1 as i64, a2 as i32) {
@@ -526,7 +597,15 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 }
                 addr as usize
             }
-            Err(_) => neg_errno(ENOSYS),
+            Err(err) => {
+                if (a3 as i32 & 0x20) == 0 {
+                    println!(
+                        "MMAP file-backed err: fd={} addr={:#x} len={:#x} prot={:#x} flags={:#x} off={:#x} err={:?}",
+                        a4 as i32, a0, a1, a2, a3, a5, err
+                    );
+                }
+                neg_errno(ENOSYS)
+            }
         },
         SYS_MPROTECT => match user::mprotect(a0 as u64, a1 as u64, a2 as i32) {
             Ok(()) => 0,
@@ -548,11 +627,17 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_ACCESS => {
             let path = match read_cstr(a0 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("ACCESS read_cstr err ptr={:#x} err={}", a0, e);
+                    return neg_errno(e);
+                }
             };
+            println!("ACCESS path={} mode={:#x}", path, a1);
             if vfs::exists(&path) {
+                println!("ACCESS ok path={}", path);
                 0
             } else {
+                println!("ACCESS err path={}", path);
                 neg_errno(ENOENT)
             }
         }
@@ -586,7 +671,10 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_OPEN => {
             let path = match read_cstr(a0 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("OPEN read_cstr err ptr={:#x} err={}", a0, e);
+                    return neg_errno(e);
+                }
             };
             println!("OPEN path={} flags={:#x}", path, a1);
             match vfs::open(&path, a1 as i32) {
@@ -603,7 +691,10 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_OPENAT => {
             let path = match read_cstr(a1 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("OPENAT read_cstr err ptr={:#x} err={}", a1, e);
+                    return neg_errno(e);
+                }
             };
             println!("OPENAT dirfd={} path={} flags={:#x}", a0 as i32, path, a2);
             match vfs::open(&path, a2 as i32) {
@@ -620,26 +711,48 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_FACCESSAT => {
             let path = match read_cstr(a1 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("FACCESSAT read_cstr err ptr={:#x} err={}", a1, e);
+                    return neg_errno(e);
+                }
             };
+            println!(
+                "FACCESSAT dirfd={} path={} mode={:#x} flags={:#x}",
+                a0 as i32, path, a2, a3
+            );
             if vfs::exists(&path) {
+                println!("FACCESSAT ok path={}", path);
                 0
             } else {
+                println!("FACCESSAT err path={}", path);
                 neg_errno(ENOENT)
             }
         }
         SYS_NEWFSTATAT => {
             let path = match read_cstr(a1 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("NEWFSTATAT read_cstr err ptr={:#x} err={}", a1, e);
+                    return neg_errno(e);
+                }
             };
+            println!("NEWFSTATAT dirfd={} path={} flags={:#x}", a0 as i32, path, a3);
             let fd = match vfs::open(&path, 0) {
                 Ok(fd) => fd,
-                Err(e) => return neg_errno(from_vfs_err(e)),
+                Err(e) => {
+                    println!("NEWFSTATAT err path={} err={:?}", path, e);
+                    return neg_errno(from_vfs_err(e));
+                }
             };
             let rc = match vfs::fstat(fd) {
-                Ok(st) => write_stat(a2 as *mut LinuxStat, st.ino, st.mode, st.size),
-                Err(e) => neg_errno(from_vfs_err(e)),
+                Ok(st) => {
+                    println!("NEWFSTATAT ok path={} size={}", path, st.size);
+                    write_stat(a2 as *mut LinuxStat, st.ino, st.mode, st.size)
+                }
+                Err(e) => {
+                    println!("NEWFSTATAT fstat err path={} err={:?}", path, e);
+                    neg_errno(from_vfs_err(e))
+                }
             };
             let _ = vfs::close(fd);
             rc
@@ -647,7 +760,10 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_READLINKAT => {
             let path = match read_cstr(a1 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("READLINKAT read_cstr err ptr={:#x} err={}", a1, e);
+                    return neg_errno(e);
+                }
             };
             let out = a2 as *mut u8;
             let size = a3;
@@ -680,7 +796,10 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         SYS_EXECVE => {
             let path = match read_cstr(a0 as *const u8, 4096) {
                 Ok(v) => v,
-                Err(e) => return neg_errno(e),
+                Err(e) => {
+                    println!("EXECVE read_cstr err ptr={:#x} err={}", a0, e);
+                    return neg_errno(e);
+                }
             };
             match user::execve(&path, &[], &[]) {
                 Ok(()) => 0,
