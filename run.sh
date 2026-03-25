@@ -3,7 +3,12 @@ set -e
 
 # Build the kernel for the freestanding target so Limine can load it directly.
 echo "Building the kernel (Limine target)..."
-cargo build -p kernel
+KERNEL_RUSTFLAGS="${KERNEL_RUSTFLAGS:-}"
+if [ -n "$KERNEL_RUSTFLAGS" ]; then
+    RUSTFLAGS="$KERNEL_RUSTFLAGS" cargo build -p kernel
+else
+    cargo build -p kernel
+fi
 
 KERNEL_BIN="target/x86_64-unknown-none/debug/kernel"
 LIMINE_BOOT="limine/bin/BOOTX64.EFI"

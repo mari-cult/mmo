@@ -19,6 +19,21 @@ const XFS_MAX_SECTOR_SIZE: usize = 4096;
 const CRABFS_EXTENT_DIR_MAGIC: [u8; 8] = *b"CDIR0001";
 
 #[inline]
+fn bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < left.len() {
+        if left[i] != right[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[inline]
 fn ag_start(sb: &Superblock, agno: u32) -> Result<u64, ReadError> {
     if agno >= sb.ag_count {
         return Err(ReadError::Device(DeviceError::OutOfRange));
@@ -208,6 +223,67 @@ pub struct DirEntry {
 /// # Errors
 ///
 /// * [`ReadError`]
+pub fn find_dir_entry<D: BlockDevice>(
+    dev: &mut D,
+    sb: &Superblock,
+    dir_ino: u64,
+    target: &str,
+) -> Result<Option<(u64, u8)>, ReadError> {
+    let inosz = sb.inode_size as usize;
+    let mut scratch = vec![0u8; inosz];
+    let inode = read_inode(dev, sb, dir_ino, &mut scratch)?;
+
+    if (inode.mode & 0xf000) != 0x4000 {
+        return Err(ReadError::Parse(ParseError::InvalidField {
+            field: "mode",
+            value: u64::from(inode.mode),
+        }));
+    }
+
+    match inode.format {
+        crate::on_disk::inode::InodeFormat::Local => {
+            let data = &scratch[176..];
+            let (hdr, mut pos) = DirSfHeader::parse(data)?;
+            if target == "." {
+                return Ok(Some((dir_ino, 2)));
+            }
+            if target == ".." {
+                return Ok(Some((hdr.parent, 2)));
+            }
+            let has_ftype = sb.has_incompat_feature(XFS_SB_FEAT_INCOMPAT_FTYPE);
+            for _ in 0..hdr.count {
+                let start = pos;
+                let (entry, consumed) = DirSfEntry::parse(&data[pos..], hdr.i8count, has_ftype)?;
+                pos += consumed;
+                let name_end = start + 3 + entry.namelen as usize;
+                if bytes_eq(&data[start + 3..name_end], target.as_bytes()) {
+                    return Ok(Some((entry.inumber, entry.ftype)));
+                }
+            }
+            Ok(None)
+        }
+        crate::on_disk::inode::InodeFormat::Extents => {
+            let data = read_extent_payload(dev, sb, &inode, &scratch, inode.size as u64)?;
+            if data.len() >= CRABFS_EXTENT_DIR_MAGIC.len()
+                && bytes_eq(
+                    &data[..CRABFS_EXTENT_DIR_MAGIC.len()],
+                    &CRABFS_EXTENT_DIR_MAGIC,
+                )
+            {
+                find_extent_dir_entry(&data, dir_ino, target)
+            } else if target == "." || target == ".." {
+                Ok(Some((dir_ino, 2)))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// # Errors
+///
+/// * [`ReadError`]
 pub fn list_dir_entries<D: BlockDevice>(
     dev: &mut D,
     sb: &Superblock,
@@ -258,7 +334,10 @@ pub fn list_dir_entries<D: BlockDevice>(
         crate::on_disk::inode::InodeFormat::Extents => {
             let data = read_extent_payload(dev, sb, &inode, &scratch, inode.size as u64)?;
             if data.len() >= CRABFS_EXTENT_DIR_MAGIC.len()
-                && data[..CRABFS_EXTENT_DIR_MAGIC.len()] == CRABFS_EXTENT_DIR_MAGIC
+                && bytes_eq(
+                    &data[..CRABFS_EXTENT_DIR_MAGIC.len()],
+                    &CRABFS_EXTENT_DIR_MAGIC,
+                )
             {
                 parse_extent_dir_entries(&data, ino_num)
             } else {
@@ -421,6 +500,41 @@ fn parse_extent_dir_entries(data: &[u8], ino_num: u64) -> Result<Vec<DirEntry>, 
         entries.push(DirEntry { ino, name, ftype });
     }
     Ok(entries)
+}
+
+fn find_extent_dir_entry(
+    data: &[u8],
+    ino_num: u64,
+    target: &str,
+) -> Result<Option<(u64, u8)>, ReadError> {
+    if data.len() < 20 {
+        return Err(ReadError::Parse(ParseError::BufferTooSmall {
+            expected: 20,
+            actual: data.len(),
+        }));
+    }
+    let count = be_u32(data, 8) as usize;
+    let parent = be_u64(data, 12);
+    if target == "." {
+        return Ok(Some((ino_num, 2)));
+    }
+    if target == ".." {
+        return Ok(Some((parent, 2)));
+    }
+    let mut pos = 20usize;
+    for _ in 0..count {
+        require_len(data, pos + 11)?;
+        let ino = be_u64(data, pos);
+        let ftype = data[pos + 8];
+        let name_len = be_u16(data, pos + 9) as usize;
+        pos += 11;
+        require_len(data, pos + name_len)?;
+        if bytes_eq(&data[pos..pos + name_len], target.as_bytes()) {
+            return Ok(Some((ino, ftype)));
+        }
+        pos += name_len;
+    }
+    Ok(None)
 }
 
 /// # Errors

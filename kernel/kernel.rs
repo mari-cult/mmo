@@ -198,15 +198,42 @@ pub extern "C" fn kernel_main() -> ! {
                         vfs::lookup("/usr/lib/libncursesw.so.6").is_ok(),
                         vfs::lookup("/usr/lib/libtinfow.so.6").is_ok()
                     );
+                    for path in [
+                        "/usr/bin/clear",
+                        "/usr/bin/bash",
+                        "/usr/lib/ld-musl-x86_64.so.1",
+                        "/lib/ld-musl-x86_64.so.1",
+                        "/usr/lib/libtinfotw.so.6",
+                        "/lib/libtinfotw.so.6",
+                        "/usr/lib/libc.so",
+                        "/usr/lib/libreadline.so.8",
+                        "/usr/lib/libncursesw.so.6",
+                        "/usr/lib/libtinfow.so.6",
+                    ] {
+                        let _ = vfs::cache_path(path);
+                        match vfs::stat_path(path, true) {
+                            Ok(st) => {
+                                println!(
+                                    "LINUX-LIKE KERNEL: stat path={} ino={} mode={:#o} size={}",
+                                    path, st.ino, st.mode, st.size
+                                );
+                            }
+                            Err(err) => {
+                                println!("LINUX-LIKE KERNEL: stat path={} err={:?}", path, err);
+                            }
+                        }
+                    }
+                    let _ = vfs::cache_missing_path("/usr/etc/ld-musl-x86_64.path");
                     if let Ok(path_bytes) = vfs::read_all("/etc/ld-musl-x86_64.path") {
                         if let Ok(path_text) = core::str::from_utf8(&path_bytes) {
-                            println!(
-                                "LINUX-LIKE KERNEL: ld-musl path file={:?}",
-                                path_text
-                            );
+                            println!("LINUX-LIKE KERNEL: ld-musl path file={:?}", path_text);
                         }
                     }
                     let init_path = cmdline::resolved_init_path();
+                    user::debug_file_elf(&init_path);
+                    user::debug_file_elf("/lib/ld-musl-x86_64.so.1");
+                    user::debug_file_elf("/usr/lib/libtinfotw.so.6");
+                    user::debug_file_elf("/lib/libtinfotw.so.6");
                     match user::create_init_task(3, &init_path) {
                         Ok(task) => {
                             println!("LINUX-LIKE KERNEL: PID1 {} task prepared", init_path);
@@ -236,7 +263,8 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    if let Some(reclaim_base) = reclaim_demo_base {
+    if false {
+        let reclaim_base = reclaim_demo_base.expect("reclaim demo base");
         unsafe {
             for offset in 0..zram::PAGE_SIZE {
                 reclaim_base
@@ -287,58 +315,60 @@ pub extern "C" fn kernel_main() -> ! {
         println!("LINUX-LIKE KERNEL: reclaim demo unavailable without Limine memory services");
     }
 
-    let mut zram_device = zram::ZramDevice::new(64);
-    let mut zswap_cache = zram::ZswapCache::new(64);
+    if false {
+        let mut zram_device = zram::ZramDevice::new(64);
+        let mut zswap_cache = zram::ZswapCache::new(64);
 
-    let mut raw_page = [0u8; zram::PAGE_SIZE];
-    let mut seed = 0x1234_5678u32;
-    for byte in raw_page.iter_mut() {
-        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        *byte = (seed >> 24) as u8;
+        let mut raw_page = [0u8; zram::PAGE_SIZE];
+        let mut seed = 0x1234_5678u32;
+        for byte in raw_page.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (seed >> 24) as u8;
+        }
+
+        let mut compressible_page = [0u8; zram::PAGE_SIZE];
+        for (index, byte) in compressible_page.iter_mut().enumerate() {
+            *byte = if index % 2 == 0 { b'A' } else { b'B' };
+        }
+
+        zram_device
+            .store_page(0, &raw_page)
+            .expect("zram store failed");
+        zram_device
+            .store_page(1, &compressible_page)
+            .expect("zram store failed");
+        let raw_roundtrip = zram_device.load_page(0).expect("zram load failed");
+        let compressed_roundtrip = zram_device.load_page(1).expect("zram load failed");
+        assert_eq!(raw_page.as_slice(), raw_roundtrip.as_slice());
+        assert_eq!(
+            compressible_page.as_slice(),
+            compressed_roundtrip.as_slice()
+        );
+
+        zswap_cache
+            .store(7, &compressible_page)
+            .expect("zswap store failed");
+        let zswap_roundtrip = zswap_cache.load(7).expect("zswap load failed");
+        assert_eq!(compressible_page.as_slice(), zswap_roundtrip.as_slice());
+        zswap_cache.invalidate(7).expect("zswap invalidate failed");
+
+        let zram_stats = zram_device.stats();
+        let zswap_stats = zswap_cache.stats();
+        println!(
+            "LINUX-LIKE KERNEL: zram stores={}, loads={}, raw_pages={}, compressed_pages={}, logical_bytes={}, stored_bytes={}, zspages={}",
+            zram_stats.stores,
+            zram_stats.loads,
+            zram_stats.raw_pages,
+            zram_stats.compressed_pages,
+            zram_stats.logical_bytes,
+            zram_stats.stored_bytes,
+            zram_stats.allocator.zspages
+        );
+        println!(
+            "LINUX-LIKE KERNEL: zswap hits={}, misses={}, backend_invalidations={}",
+            zswap_stats.hits, zswap_stats.misses, zswap_stats.backend.invalidations
+        );
     }
-
-    let mut compressible_page = [0u8; zram::PAGE_SIZE];
-    for (index, byte) in compressible_page.iter_mut().enumerate() {
-        *byte = if index % 2 == 0 { b'A' } else { b'B' };
-    }
-
-    zram_device
-        .store_page(0, &raw_page)
-        .expect("zram store failed");
-    zram_device
-        .store_page(1, &compressible_page)
-        .expect("zram store failed");
-    let raw_roundtrip = zram_device.load_page(0).expect("zram load failed");
-    let compressed_roundtrip = zram_device.load_page(1).expect("zram load failed");
-    assert_eq!(raw_page.as_slice(), raw_roundtrip.as_slice());
-    assert_eq!(
-        compressible_page.as_slice(),
-        compressed_roundtrip.as_slice()
-    );
-
-    zswap_cache
-        .store(7, &compressible_page)
-        .expect("zswap store failed");
-    let zswap_roundtrip = zswap_cache.load(7).expect("zswap load failed");
-    assert_eq!(compressible_page.as_slice(), zswap_roundtrip.as_slice());
-    zswap_cache.invalidate(7).expect("zswap invalidate failed");
-
-    let zram_stats = zram_device.stats();
-    let zswap_stats = zswap_cache.stats();
-    println!(
-        "LINUX-LIKE KERNEL: zram stores={}, loads={}, raw_pages={}, compressed_pages={}, logical_bytes={}, stored_bytes={}, zspages={}",
-        zram_stats.stores,
-        zram_stats.loads,
-        zram_stats.raw_pages,
-        zram_stats.compressed_pages,
-        zram_stats.logical_bytes,
-        zram_stats.stored_bytes,
-        zram_stats.allocator.zspages
-    );
-    println!(
-        "LINUX-LIKE KERNEL: zswap hits={}, misses={}, backend_invalidations={}",
-        zswap_stats.hits, zswap_stats.misses, zswap_stats.backend.invalidations
-    );
 
     if let Some(task) = init_task {
         process::SCHEDULER.lock().add_task(task);
