@@ -52,11 +52,13 @@ impl Vfs {
     }
 
     fn lookup_path(&mut self, path: &str) -> Result<u64, VfsError> {
-        self.lookup_path_inner(path, true, 0)
+        let normalized = normalize_path(path);
+        self.lookup_path_inner(&normalized, true, 0)
     }
 
     fn lookup_path_nofollow(&mut self, path: &str) -> Result<u64, VfsError> {
-        self.lookup_path_inner(path, false, 0)
+        let normalized = normalize_path(path);
+        self.lookup_path_inner(&normalized, false, 0)
     }
 
     fn lookup_path_inner(
@@ -118,7 +120,8 @@ impl Vfs {
     }
 
     fn open(&mut self, path: &str, _flags: i32) -> Result<i32, VfsError> {
-        let ino = self.lookup_path(path)?;
+        let normalized = normalize_path(path);
+        let ino = self.lookup_path(&normalized)?;
         let fd = self.next_fd;
         self.next_fd = self.next_fd.saturating_add(1);
         self.files.insert(
@@ -126,7 +129,7 @@ impl Vfs {
             OpenFile {
                 ino,
                 offset: 0,
-                path: path.to_string(),
+                path: normalized,
             },
         );
         Ok(fd)
@@ -297,4 +300,14 @@ pub fn path_of_fd(fd: i32) -> Result<String, VfsError> {
 
 pub fn getcwd() -> String {
     "/".to_string()
+}
+
+fn normalize_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        let mut out = String::from("/");
+        out.push_str(path);
+        out
+    }
 }

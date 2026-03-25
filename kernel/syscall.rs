@@ -29,6 +29,7 @@ const ENAMETOOLONG: i32 = 36;
 
 const SYS_READ: usize = 0;
 const SYS_WRITE: usize = 1;
+const SYS_OPEN: usize = 2;
 const SYS_CLOSE: usize = 3;
 const SYS_FSTAT: usize = 5;
 const SYS_PREAD64: usize = 17;
@@ -49,6 +50,7 @@ const SYS_PPOLL: usize = 271;
 const SYS_NANOSLEEP: usize = 35;
 const SYS_GETPID: usize = 39;
 const SYS_ACCESS: usize = 21;
+const SYS_WRITEV: usize = 20;
 const SYS_GETCWD: usize = 79;
 const SYS_ARCH_PRCTL: usize = 158;
 const SYS_GETPPID: usize = 110;
@@ -122,6 +124,12 @@ struct LinuxUtsname {
     version: [u8; 65],
     machine: [u8; 65],
     domainname: [u8; 65],
+}
+
+#[repr(C)]
+struct LinuxIovec {
+    iov_base: *const u8,
+    iov_len: usize,
 }
 
 fn neg_errno(code: i32) -> usize {
@@ -349,6 +357,36 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
                 neg_errno(EBADF)
             }
         }
+        SYS_WRITEV => {
+            let fd = a0 as i32;
+            let iov = a1 as *const LinuxIovec;
+            let iovcnt = a2;
+            if iov.is_null() {
+                return neg_errno(EFAULT);
+            }
+            let mut total = 0usize;
+            for idx in 0..iovcnt {
+                let ent = unsafe { &*iov.add(idx) };
+                if ent.iov_base.is_null() {
+                    return neg_errno(EFAULT);
+                }
+                let data = unsafe { core::slice::from_raw_parts(ent.iov_base, ent.iov_len) };
+                let wrote = if fd == 1 || fd == 2 {
+                    if let Ok(s) = core::str::from_utf8(data) {
+                        print!("{}", s);
+                    } else {
+                        for b in data {
+                            print!("{}", *b as char);
+                        }
+                    }
+                    ent.iov_len
+                } else {
+                    return neg_errno(EBADF);
+                };
+                total = total.saturating_add(wrote);
+            }
+            total
+        }
         SYS_CLOSE => match vfs::close(a0 as i32) {
             Ok(()) => 0,
             Err(e) => neg_errno(from_vfs_err(e)),
@@ -437,6 +475,16 @@ extern "C" fn syscall_dispatch(args: *const SyscallArgs) -> usize {
         }
         SYS_CLOCK_GETTIME => 0,
         SYS_EXIT | SYS_EXIT_GROUP => process::on_task_exit(),
+        SYS_OPEN => {
+            let path = match read_cstr(a0 as *const u8, 4096) {
+                Ok(v) => v,
+                Err(e) => return neg_errno(e),
+            };
+            match vfs::open(&path, a1 as i32) {
+                Ok(fd) => fd as usize,
+                Err(e) => neg_errno(from_vfs_err(e)),
+            }
+        }
         SYS_OPENAT => {
             let path = match read_cstr(a1 as *const u8, 4096) {
                 Ok(v) => v,
