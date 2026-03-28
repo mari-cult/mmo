@@ -428,7 +428,9 @@ fn frame_bytes(frame: PhysFrame<Size4KiB>) -> Result<*mut u8, UserError> {
     Ok((offset.as_u64() + frame.start_address().as_u64()) as *mut u8)
 }
 
-fn duplicate_mappings(src: &BTreeMap<u64, UserMapping>) -> Result<BTreeMap<u64, UserMapping>, UserError> {
+fn duplicate_mappings(
+    src: &BTreeMap<u64, UserMapping>,
+) -> Result<BTreeMap<u64, UserMapping>, UserError> {
     let mut out = BTreeMap::new();
     for (virt, mapping) in src {
         let frame = allocator::allocate_frame().map_err(|_| UserError::Vm)?;
@@ -501,7 +503,10 @@ fn reap_child(pid: i32) -> Result<Option<(u32, i32)>, UserError> {
         }
         let status = proc.exit_status;
         registry.by_pid.remove(&child_pid);
-        current_slot().lock().children.retain(|candidate| *candidate != child_pid);
+        current_slot()
+            .lock()
+            .children
+            .retain(|candidate| *candidate != child_pid);
         if let Some(parent) = registry.by_pid.get_mut(&self_pid) {
             parent.children.retain(|candidate| *candidate != child_pid);
         }
@@ -643,7 +648,11 @@ pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, Use
     Ok(task)
 }
 
-pub fn execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<process::SavedTaskContext, UserError> {
+pub fn execve(
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<process::SavedTaskContext, UserError> {
     destroy_current_image()?;
     let ctx = load_exec_context(
         current_task_id().ok_or(UserError::Unsupported)?,
@@ -800,8 +809,12 @@ fn alloc_fd_slot(min_fd: i32) -> Result<usize, UserError> {
 
 pub fn open_fd(path: &str, flags: i32) -> Result<i32, UserError> {
     let handle = vfs::open(path, flags).map_err(|_| UserError::Vfs)?;
-    let slot = alloc_fd_slot(0)?;
-    current_slot().lock().fd_table[slot] = Some(UserFd { handle, fd_flags: 0 });
+    install_fd(handle, 0, 0)
+}
+
+pub fn install_fd(handle: i32, min_fd: i32, fd_flags: i32) -> Result<i32, UserError> {
+    let slot = alloc_fd_slot(min_fd)?;
+    current_slot().lock().fd_table[slot] = Some(UserFd { handle, fd_flags });
     Ok(slot as i32)
 }
 
@@ -1016,7 +1029,14 @@ fn load_exec_context(
         let q3 = unsafe { *((stack.rsp + 24) as *const u64) };
         ktrace!(
             "USER-STACK rsp={:#x} argc={} argv_ptr={:#x} envp_ptr={:#x} q0={:#x} q1={:#x} q2={:#x} q3={:#x}",
-            stack.rsp, stack.argc, stack.argv_ptr, stack.envp_ptr, q0, q1, q2, q3
+            stack.rsp,
+            stack.argc,
+            stack.argv_ptr,
+            stack.envp_ptr,
+            q0,
+            q1,
+            q2,
+            q3
         );
     }
 

@@ -1,13 +1,15 @@
 extern crate alloc;
 
-use crate::{gdt, kdebug, ktrace, kwarn, print, process, smp::MAX_CPUS, user, vfs};
+use crate::{gdt, kdebug, ktrace, kwarn, process, smp::MAX_CPUS, user, vfs};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::Segment;
-use x86_64::registers::model_specific::{Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star};
 use x86_64::registers::model_specific::FsBase;
+use x86_64::registers::model_specific::{
+    Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star,
+};
 use x86_64::registers::rflags::RFlags;
 
 const EPERM: i32 = 1;
@@ -24,6 +26,7 @@ const ENODEV: i32 = 19;
 const ENOTDIR: i32 = 20;
 const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
+const EPIPE: i32 = 32;
 const ENFILE: i32 = 23;
 const EMFILE: i32 = 24;
 const ENOSPC: i32 = 28;
@@ -51,6 +54,7 @@ const SYS_LSTAT: usize = 6;
 const SYS_FCNTL: usize = 72;
 const SYS_PREAD64: usize = 17;
 const SYS_GETDENTS64: usize = 217;
+const SYS_FADVISE64: usize = 221;
 const SYS_READV: usize = 19;
 const SYS_LSEEK: usize = 8;
 const SYS_DUP: usize = 32;
@@ -93,6 +97,9 @@ const SYS_FACCESSAT2: usize = 439;
 const SYS_NEWFSTATAT: usize = 262;
 const SYS_STATX: usize = 332;
 const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const TCSETSW: usize = 0x5403;
+const TCSETSF: usize = 0x5404;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCGPGRP: usize = 0x540f;
 const TIOCSPGRP: usize = 0x5410;
@@ -272,9 +279,6 @@ struct LinuxPollFd {
     revents: i16,
 }
 
-const POLLIN: i16 = 0x0001;
-const POLLOUT: i16 = 0x0004;
-
 fn neg_errno(code: i32) -> usize {
     (-(code as isize)) as usize
 }
@@ -287,6 +291,8 @@ fn from_vfs_err(err: vfs::VfsError) -> i32 {
         vfs::VfsError::InvalidPath => EINVAL,
         vfs::VfsError::Io => EIO,
         vfs::VfsError::InvalidFd => EBADF,
+        vfs::VfsError::WouldBlock => EAGAIN,
+        vfs::VfsError::BrokenPipe => EPIPE,
     }
 }
 
@@ -623,7 +629,13 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
     if trace_idx < 2048 && nr != SYS_WRITEV {
         ktrace!(
             "SYSCALL: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-            nr, a0, a1, a2, a3, a4, a5
+            nr,
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5
         );
     }
     if nr == SYS_FORK || nr == SYS_SET_TID_ADDRESS || nr == SYS_RT_SIGPROCMASK {
@@ -749,19 +761,9 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                 Ok(handle) => handle,
                 Err(err) => return neg_errno(from_user_err(err)),
             };
-            if vfs::is_special_tty(handle).unwrap_or(false) {
-                if let Ok(s) = core::str::from_utf8(data) {
-                    print!("{}", s);
-                } else {
-                    for b in data {
-                        print!("{}", *b as char);
-                    }
-                }
-                len
-            } else if vfs::is_special_null(handle).unwrap_or(false) {
-                len
-            } else {
-                neg_errno(EBADF)
+            match vfs::write(handle, data) {
+                Ok(n) => n,
+                Err(e) => neg_errno(from_vfs_err(e)),
             }
         }
         SYS_WRITEV => {
@@ -771,6 +773,10 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             if iov.is_null() {
                 return neg_errno(EFAULT);
             }
+            let handle = match user::handle_for_fd(fd) {
+                Ok(handle) => handle,
+                Err(err) => return neg_errno(from_user_err(err)),
+            };
             let mut total = 0usize;
             for idx in 0..iovcnt {
                 let ent = unsafe { &*iov.add(idx) };
@@ -778,25 +784,14 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                     return neg_errno(EFAULT);
                 }
                 let data = unsafe { core::slice::from_raw_parts(ent.iov_base, ent.iov_len) };
-                let handle = match user::handle_for_fd(fd) {
-                    Ok(handle) => handle,
-                    Err(err) => return neg_errno(from_user_err(err)),
-                };
-                let wrote = if vfs::is_special_tty(handle).unwrap_or(false) {
-                    if let Ok(s) = core::str::from_utf8(data) {
-                        print!("{}", s);
-                    } else {
-                        for b in data {
-                            print!("{}", *b as char);
-                        }
-                    }
-                    ent.iov_len
-                } else if vfs::is_special_null(handle).unwrap_or(false) {
-                    ent.iov_len
-                } else {
-                    return neg_errno(EBADF);
+                let wrote = match vfs::write(handle, data) {
+                    Ok(n) => n,
+                    Err(e) => return neg_errno(from_vfs_err(e)),
                 };
                 total = total.saturating_add(wrote);
+                if wrote < ent.iov_len {
+                    break;
+                }
             }
             total
         }
@@ -812,14 +807,23 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                     return neg_errno(EINVAL);
                 }
             }
-            let rfd = match user::open_fd("/dev/null", 0) {
-                Ok(fd) => fd,
-                Err(e) => return neg_errno(from_user_err(e)),
+            let (rhandle, whandle) = match vfs::create_pipe() {
+                Ok(handles) => handles,
+                Err(e) => return neg_errno(from_vfs_err(e)),
             };
-            let wfd = match user::open_fd("/dev/null", 1) {
+            let rfd = match user::install_fd(rhandle, 0, 0) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = vfs::close(rhandle);
+                    let _ = vfs::close(whandle);
+                    return neg_errno(from_user_err(e));
+                }
+            };
+            let wfd = match user::install_fd(whandle, 0, 0) {
                 Ok(fd) => fd,
                 Err(e) => {
                     let _ = user::close_fd(rfd);
+                    let _ = vfs::close(whandle);
                     return neg_errno(from_user_err(e));
                 }
             };
@@ -993,7 +997,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                     if let Some(path) = path.as_deref() {
                         ktrace!(
                             "PREAD64 fd={} path={} off={:#x} len={} -> {}",
-                            fd, path, offset, len, n
+                            fd,
+                            path,
+                            offset,
+                            len,
+                            n
                         );
                     }
                     n
@@ -1002,7 +1010,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                     if let Some(path) = path.as_deref() {
                         ktrace!(
                             "PREAD64 err fd={} path={} off={:#x} len={} err={:?}",
-                            fd, path, offset, len, e
+                            fd,
+                            path,
+                            offset,
+                            len,
+                            e
                         );
                     }
                     neg_errno(from_vfs_err(e))
@@ -1117,14 +1129,27 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                         return neg_errno(EFAULT);
                     }
                     let tio = LinuxTermios {
-                        c_iflag: 0x0000_0500, // ICRNL | IXON
-                        c_oflag: 0x0000_0005, // OPOST | ONLCR
-                        c_cflag: 0x0000_00bf, // B38400 | CS8 | CREAD
-                        c_lflag: 0x0000_8a3b, // ISIG | ICANON | ECHO* | IEXTEN
+                        c_iflag: crate::serial::tty_iflag(),
+                        c_oflag: crate::serial::tty_oflag(),
+                        c_cflag: crate::serial::tty_cflag(),
+                        c_lflag: crate::serial::tty_lflag(),
                         c_line: 0,
                         c_cc: [0; 19],
                     };
                     unsafe { (argp as *mut LinuxTermios).write_volatile(tio) };
+                    0
+                }
+                TCSETS | TCSETSW | TCSETSF => {
+                    if argp.is_null() {
+                        return neg_errno(EFAULT);
+                    }
+                    let tio = unsafe { (argp as *const LinuxTermios).read_volatile() };
+                    crate::serial::set_tty_termios(
+                        tio.c_iflag,
+                        tio.c_oflag,
+                        tio.c_cflag,
+                        tio.c_lflag,
+                    );
                     0
                 }
                 _ => neg_errno(ENOTTY),
@@ -1137,7 +1162,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                 if (a3 as i32 & 0x20) == 0 {
                     ktrace!(
                         "MMAP file-backed: fd={} addr={:#x} len={:#x} off={:#x} -> {:#x}",
-                        a4 as i32, a0, a1, a5, addr
+                        a4 as i32,
+                        a0,
+                        a1,
+                        a5,
+                        addr
                     );
                 }
                 addr as usize
@@ -1146,7 +1175,13 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                 if (a3 as i32 & 0x20) == 0 {
                     kdebug!(
                         "MMAP file-backed err: fd={} addr={:#x} len={:#x} prot={:#x} flags={:#x} off={:#x} err={:?}",
-                        a4 as i32, a0, a1, a2, a3, a5, err
+                        a4 as i32,
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        a5,
+                        err
                     );
                 }
                 neg_errno(ENOSYS)
@@ -1341,7 +1376,10 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             };
             ktrace!(
                 "FACCESSAT dirfd={} path={} mode={:#x} flags={:#x}",
-                a0 as i32, path, a2, a3
+                a0 as i32,
+                path,
+                a2,
+                a3
             );
             if vfs::exists(&path) {
                 ktrace!("FACCESSAT ok path={}", path);
@@ -1361,7 +1399,9 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             };
             ktrace!(
                 "NEWFSTATAT dirfd={} path={} flags={:#x}",
-                a0 as i32, path, a3
+                a0 as i32,
+                path,
+                a3
             );
             let dirfd = a0 as i32;
             let flags = a3 as i32;
@@ -1414,7 +1454,10 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             let mask = a3 as u32;
             ktrace!(
                 "STATX dirfd={} path={} flags={:#x} mask={:#x}",
-                dirfd, path, flags, mask
+                dirfd,
+                path,
+                flags,
+                mask
             );
             if path.is_empty() {
                 if (flags & AT_EMPTY_PATH) == 0 {
@@ -1519,6 +1562,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
         SYS_UNAME => write_uts(a0 as *mut LinuxUtsname),
         SYS_SET_ROBUST_LIST => 0,
         SYS_PRLIMIT64 => 0,
+        SYS_FADVISE64 => 0,
         SYS_GETRANDOM => {
             let buf = a0 as *mut u8;
             let len = a1;
@@ -1547,17 +1591,12 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             for idx in 0..nfds {
                 let pfd = unsafe { &mut *fds.add(idx) };
                 pfd.revents = 0;
-                if vfs::is_special_tty(pfd.fd).unwrap_or(false) {
-                    if (pfd.events & POLLIN) != 0 && crate::serial::has_input() {
-                        pfd.revents |= POLLIN;
-                    }
-                    if (pfd.events & POLLOUT) != 0 {
-                        pfd.revents |= POLLOUT;
-                    }
-                } else if vfs::is_special_null(pfd.fd).unwrap_or(false) {
-                    if (pfd.events & POLLOUT) != 0 {
-                        pfd.revents |= POLLOUT;
-                    }
+                let handle = match user::handle_for_fd(pfd.fd) {
+                    Ok(handle) => handle,
+                    Err(_) => continue,
+                };
+                if let Ok(mask) = vfs::poll_mask(handle) {
+                    pfd.revents |= pfd.events & mask;
                 }
                 if pfd.revents != 0 {
                     ready += 1;

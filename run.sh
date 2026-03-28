@@ -107,7 +107,7 @@ cp "$EFI_ROOT/limine.conf" "$EFI_ROOT/EFI/BOOT/limine.conf"
 echo "Running in QEMU (using Limine UEFI boot)..."
 qemu-system-x86_64 \
     -smp 2 \
-    -accel tcg,thread=multi \
+    -accel kvm \
     -bios DEBUGX64_OVMF.fd \
     -drive file=fat:rw:"$EFI_ROOT",format=raw \
     -drive if=none,id=drv0,file="$ROOTFS_IMG",format=raw \

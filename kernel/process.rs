@@ -1,5 +1,5 @@
-use crate::{apic, ktrace, println};
 use crate::smp::MAX_CPUS;
+use crate::{apic, ktrace, println};
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -833,7 +833,7 @@ pub fn on_task_exit() -> ! {
 
     loop {
         unsafe {
-            asm!("hlt");
+            asm!("sti; hlt; cli");
         }
     }
 }
