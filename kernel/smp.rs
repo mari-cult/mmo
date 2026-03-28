@@ -1,11 +1,11 @@
 use crate::println;
 use core::arch::asm;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use limine::mp::Cpu;
 use limine::request::MpRequest;
 
-const MAX_CPUS: usize = 32;
+pub const MAX_CPUS: usize = 32;
 const AP_BOOT_SPINS: usize = 2_000_000;
 
 #[used]
@@ -15,6 +15,7 @@ pub static MP_REQUEST: MpRequest = MpRequest::new();
 static DISCOVERED_CPUS: AtomicUsize = AtomicUsize::new(1);
 static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
 static AP_READY: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static LAPIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
 
 #[derive(Debug, Clone, Copy)]
 pub struct CpuTopology {
@@ -37,6 +38,7 @@ pub fn init() -> CpuTopology {
 
         for (logical_id, cpu) in cpus.iter().take(discovered).enumerate() {
             cpu.extra.store(logical_id as u64, Ordering::SeqCst);
+            LAPIC_IDS[logical_id].store(cpu.lapic_id, Ordering::SeqCst);
             if cpu.lapic_id == response.bsp_lapic_id() {
                 AP_READY[logical_id].store(true, Ordering::SeqCst);
                 continue;
@@ -83,8 +85,25 @@ pub fn online_cpus() -> usize {
     ONLINE_CPUS.load(Ordering::SeqCst)
 }
 
+pub fn logical_cpu_id(lapic_id: u32) -> Option<usize> {
+    let discovered = DISCOVERED_CPUS.load(Ordering::SeqCst).min(MAX_CPUS);
+    (0..discovered).find(|idx| LAPIC_IDS[*idx].load(Ordering::SeqCst) == lapic_id)
+}
+
+pub fn current_cpu() -> usize {
+    let Some(lapic_id) = crate::apic::current_lapic_id() else {
+        return 0;
+    };
+    logical_cpu_id(lapic_id).unwrap_or(0)
+}
+
 unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
     let logical_id = cpu.extra.load(Ordering::SeqCst) as usize;
+    crate::gdt::init_for_cpu(logical_id);
+    crate::idt::load_local();
+    crate::init_local_cpu_features();
+    crate::apic::init();
+    crate::syscall::init_for_cpu(logical_id);
     ONLINE_CPUS.fetch_add(1, Ordering::SeqCst);
     if logical_id < MAX_CPUS {
         AP_READY[logical_id].store(true, Ordering::SeqCst);
@@ -92,7 +111,7 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
 
     loop {
         unsafe {
-            asm!("cli; hlt");
+            asm!("sti; hlt; cli");
         }
     }
 }

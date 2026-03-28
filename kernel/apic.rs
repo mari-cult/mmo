@@ -95,6 +95,13 @@ pub fn complete_interrupt() {
     }
 }
 
+pub fn current_lapic_id() -> Option<u32> {
+    unsafe {
+        let apic = core::ptr::addr_of!(APIC).read();
+        apic.map(|apic| apic.read(0x20) >> 24)
+    }
+}
+
 fn mapped_base_for(physical_addr: u64) -> Result<u64, VmError> {
     if !allocator::runtime_ready() {
         return Err(VmError::RuntimeNotInitialized);

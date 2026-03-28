@@ -10,6 +10,9 @@ pub struct KernelParams {
     pub init: Option<String>,
     pub root: Option<String>,
     pub rootfstype: Option<String>,
+    pub debug: bool,
+    pub quiet: bool,
+    pub loglevel: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,13 +72,24 @@ fn parse_kernel_params() -> KernelParams {
     };
 
     for token in raw.split_ascii_whitespace() {
-        let Some((key, value)) = token.split_once('=') else {
+        if let Some((key, value)) = token.split_once('=') {
+            match key {
+                "init" => params.init = Some(value.to_string()),
+                "root" => params.root = Some(value.to_string()),
+                "rootfstype" => params.rootfstype = Some(value.to_string()),
+                "loglevel" => {
+                    if let Ok(level) = value.parse::<u8>() {
+                        params.loglevel = Some(level.min(7));
+                    }
+                }
+                _ => {}
+            }
             continue;
-        };
-        match key {
-            "init" => params.init = Some(value.to_string()),
-            "root" => params.root = Some(value.to_string()),
-            "rootfstype" => params.rootfstype = Some(value.to_string()),
+        }
+
+        match token {
+            "debug" => params.debug = true,
+            "quiet" => params.quiet = true,
             _ => {}
         }
     }
