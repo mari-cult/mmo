@@ -12,6 +12,7 @@ pub mod apic;
 pub mod cmdline;
 pub mod gdt;
 pub mod idt;
+pub mod log;
 pub mod paging;
 pub mod pci;
 pub mod process;
@@ -152,21 +153,20 @@ pub extern "C" fn kernel_main() -> ! {
 
     println!("LINUX-LIKE KERNEL: Heap initialized.");
     let params = cmdline::params();
+    log::init(params);
     if !params.raw.is_empty() {
-        println!("LINUX-LIKE KERNEL: cmdline=\"{}\"", params.raw);
+        kinfo!("cmdline=\"{}\"", params.raw);
     }
+    kdebug!(
+        "logging configured debug={} quiet={} loglevel={:?}",
+        params.debug,
+        params.quiet,
+        params.loglevel
+    );
 
     gdt::init();
     idt::init();
-    unsafe {
-        Cr0::update(|cr0| {
-            cr0.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
-            cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
-        });
-        Cr4::update(|cr4| {
-            cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
-        });
-    }
+    init_local_cpu_features();
     apic::init();
     println!("LINUX-LIKE KERNEL: GDT/IDT/APIC initialized.");
 
@@ -382,6 +382,7 @@ pub extern "C" fn kernel_main() -> ! {
                 class_hint: Some(process::TaskClass::Game),
                 nice: -5,
                 preferred_cpu: Some(process::CpuId(0)),
+                process_id: 0,
             },
         );
         let task2 = process::Task::new(2, 0, test_task_2);
@@ -393,6 +394,18 @@ pub extern "C" fn kernel_main() -> ! {
 
     println!("LINUX-LIKE KERNEL: Starting scheduler...");
     crate::process::start();
+}
+
+pub fn init_local_cpu_features() {
+    unsafe {
+        Cr0::update(|cr0| {
+            cr0.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
+            cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
+        });
+        Cr4::update(|cr4| {
+            cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
+        });
+    }
 }
 
 pub extern "C" fn test_task_1() -> ! {

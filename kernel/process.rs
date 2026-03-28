@@ -1,4 +1,5 @@
-use crate::{apic, println};
+use crate::{apic, ktrace, println};
+use crate::smp::MAX_CPUS;
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -6,6 +7,7 @@ use core::arch::{asm, global_asm};
 use core::array;
 use core::cmp::min;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 
@@ -19,7 +21,8 @@ unsafe extern "C" {
     fn timer_interrupt_entry();
 }
 
-const KERNEL_STACK_SIZE: usize = 4096 * 4;
+const KERNEL_STACK_SIZE: usize = 4096 * 16;
+const KERNEL_STACK_RESERVE: usize = 4096;
 const SCHEDULER_STACK_SIZE: usize = 4096 * 4;
 const NUM_CLASSES: usize = 4;
 const CLASS_QUANTA: [i64; NUM_CLASSES] = [6, 4, 2, 1];
@@ -102,6 +105,7 @@ pub struct SchedParams {
     pub class_hint: Option<TaskClass>,
     pub nice: i8,
     pub preferred_cpu: Option<CpuId>,
+    pub process_id: u32,
 }
 
 impl Default for SchedParams {
@@ -110,12 +114,14 @@ impl Default for SchedParams {
             class_hint: None,
             nice: 0,
             preferred_cpu: None,
+            process_id: 0,
         }
     }
 }
 
 pub struct Task {
     pub id: usize,
+    pub process_id: u32,
     pub thread_id: usize,
     pub state: TaskState,
     pub stack: Vec<u8>,
@@ -138,6 +144,14 @@ pub struct Task {
 }
 
 impl Task {
+    fn stack_end(&self) -> usize {
+        align_down(self.stack.as_ptr() as usize + self.stack.len(), 16)
+    }
+
+    fn kernel_stack_top(&self) -> usize {
+        self.stack_end().saturating_sub(KERNEL_STACK_RESERVE)
+    }
+
     pub fn new(id: usize, thread_id: usize, entry: extern "C" fn() -> !) -> Self {
         Self::with_params(id, thread_id, entry, SchedParams::default())
     }
@@ -150,6 +164,7 @@ impl Task {
     ) -> Self {
         let mut task = Self {
             id,
+            process_id: params.process_id,
             thread_id,
             state: TaskState::Ready,
             stack: alloc::vec![0; KERNEL_STACK_SIZE],
@@ -171,7 +186,7 @@ impl Task {
             queued: false,
         };
 
-        let stack_top = align_down(task.stack.as_ptr() as usize + task.stack.len(), 16);
+        let stack_top = task.stack_end();
         // The initial task frame must look like a normal Win64 call site because the
         // UEFI target uses the Microsoft x64 ABI, including 32 bytes of shadow space.
         let call_like_rsp = stack_top - 40;
@@ -205,6 +220,7 @@ impl Task {
     ) -> Self {
         let mut task = Self {
             id,
+            process_id: params.process_id,
             thread_id,
             state: TaskState::Ready,
             stack: alloc::vec![0; KERNEL_STACK_SIZE],
@@ -225,7 +241,7 @@ impl Task {
             sleep_started_at: None,
             queued: false,
         };
-        let stack_top = align_down(task.stack.as_ptr() as usize + task.stack.len(), 16);
+        let stack_top = task.stack_end();
         let context_rsp = stack_top - size_of::<SavedTaskContext>();
         unsafe {
             *(context_rsp as *mut SavedTaskContext) = context;
@@ -274,6 +290,13 @@ pub struct Scheduler {
     llc_domains: Vec<LlcDomain>,
     global_tick: u64,
     started: bool,
+    next_task_id: usize,
+}
+
+static CURRENT_TASK_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+fn current_cpu_id() -> CpuId {
+    CpuId(crate::smp::current_cpu().min(MAX_CPUS.saturating_sub(1)))
 }
 
 impl Scheduler {
@@ -288,6 +311,7 @@ impl Scheduler {
             }],
             global_tick: 0,
             started: false,
+            next_task_id: 1,
         }
     }
 
@@ -302,6 +326,13 @@ impl Scheduler {
         self.tasks.push(task);
         self.task_lookup.insert(task_id, index);
         self.enqueue_task(task_id);
+        self.next_task_id = self.next_task_id.max(task_id.saturating_add(1));
+    }
+
+    pub fn allocate_task_id(&mut self) -> usize {
+        let task_id = self.next_task_id.max(1);
+        self.next_task_id = task_id.saturating_add(1);
+        task_id
     }
 
     pub fn configure_topology(&mut self, cpu_count: usize) {
@@ -324,17 +355,16 @@ impl Scheduler {
         self.pick_next_task(CpuId(0), None)
     }
 
-    pub fn on_timer_tick(&mut self, current_rsp: usize) -> usize {
+    pub fn on_timer_tick(&mut self, cpu: CpuId, current_rsp: usize) -> usize {
         if !self.started {
             return current_rsp;
         }
 
         self.global_tick = self.global_tick.wrapping_add(1);
         if self.global_tick % 10 == 0 {
-            println!("TICK");
+            ktrace!("sched tick={}", self.global_tick);
         }
 
-        let cpu = CpuId(0);
         let prev = self.cpus[cpu.0].current_task;
         if let Some(task_id) = prev {
             self.account_running_task(cpu, task_id, current_rsp);
@@ -423,7 +453,14 @@ impl Scheduler {
             }
         }
 
-        CpuId(0)
+        self.cpus
+            .iter()
+            .min_by_key(|rq| {
+                let queued = rq.queues.iter().map(VecDeque::len).sum::<usize>();
+                usize::from(rq.current_task.is_some()) + queued
+            })
+            .map(|rq| rq.id)
+            .unwrap_or(CpuId(0))
     }
 
     fn cpu_is_idle(&self, cpu: CpuId) -> bool {
@@ -557,6 +594,16 @@ impl Scheduler {
                     };
 
                     self.cpus[cpu_idx].current_task = Some(task_id);
+                    crate::user::activate_task(task_id);
+                    CURRENT_TASK_IDS[cpu_idx].store(task_id, Ordering::SeqCst);
+                    crate::syscall::set_kernel_stack_top(self.task(task_id).kernel_stack_top());
+                    ktrace!(
+                        "sched switch cpu={} task={} pid={} rsp={:#x}",
+                        cpu_idx,
+                        task_id,
+                        self.task(task_id).process_id,
+                        next_rsp
+                    );
                     return Some(next_rsp);
                 }
             }
@@ -577,10 +624,21 @@ impl Scheduler {
 
             if next_rsp.is_some() {
                 self.cpus[cpu_idx].current_task = Some(task_id);
+                crate::user::activate_task(task_id);
+                CURRENT_TASK_IDS[cpu_idx].store(task_id, Ordering::SeqCst);
+                crate::syscall::set_kernel_stack_top(self.task(task_id).kernel_stack_top());
+                ktrace!(
+                    "sched resume cpu={} task={} pid={} rsp={:#x}",
+                    cpu_idx,
+                    task_id,
+                    self.task(task_id).process_id,
+                    next_rsp.unwrap_or(0)
+                );
             }
             return next_rsp;
         }
 
+        CURRENT_TASK_IDS[cpu_idx].store(0, Ordering::SeqCst);
         None
     }
 
@@ -691,14 +749,14 @@ pub extern "sysv64" fn scheduler_timer_tick(
 
     let cs = unsafe { (*current_ctx).cs };
     let cpl = cs & 0x3;
-    if cpl == 0 {
+    if cpl == 0x3 {
         apic::complete_interrupt();
         return current_ctx;
     }
 
     let next_ctx = {
         let mut scheduler = SCHEDULER.lock();
-        scheduler.on_timer_tick(current_ctx as usize)
+        scheduler.on_timer_tick(current_cpu_id(), current_ctx as usize)
     };
 
     apic::complete_interrupt();
@@ -733,13 +791,13 @@ pub fn timer_handler_addr() -> usize {
 
 pub fn yield_current() {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().request_yield(CpuId(0));
+        SCHEDULER.lock().request_yield(current_cpu_id());
     });
 }
 
 pub fn block_current() {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().block_current(CpuId(0));
+        SCHEDULER.lock().block_current(current_cpu_id());
     });
 }
 
@@ -749,12 +807,24 @@ pub fn wake_task(task_id: usize) {
     });
 }
 
+pub fn current_task_id() -> Option<usize> {
+    let cpu = current_cpu_id().0;
+    match CURRENT_TASK_IDS[cpu].load(Ordering::SeqCst) {
+        0 => None,
+        task_id => Some(task_id),
+    }
+}
+
+pub fn allocate_task_id() -> usize {
+    x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().allocate_task_id())
+}
+
 pub fn on_task_exit() -> ! {
     x86_64::instructions::interrupts::disable();
 
     let next_ctx = {
         let mut scheduler = SCHEDULER.lock();
-        scheduler.exit_current(CpuId(0))
+        scheduler.exit_current(current_cpu_id())
     };
 
     if let Some(next_ctx) = next_ctx {

@@ -26,7 +26,11 @@ impl InterruptIndex {
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
+    idt.divide_error.set_handler_fn(divide_error_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection_fault_handler);
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
@@ -60,8 +64,16 @@ pub fn load_local() {
     IDT.load();
 }
 
+extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+    panic!("EXCEPTION: DIVIDE ERROR\n{:#?}", stack_frame);
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -69,6 +81,17 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT err={:#x}\n{:#?}",
+        error_code,
+        stack_frame
+    );
 }
 
 extern "x86-interrupt" fn page_fault_handler(

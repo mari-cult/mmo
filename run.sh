@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env brush
 set -e
 
 # Build the kernel for the freestanding target so Limine can load it directly.
@@ -19,13 +19,55 @@ KERNEL_INIT="${KERNEL_INIT:-}"
 KERNEL_ROOT="${KERNEL_ROOT:-/dev/vda}"
 KERNEL_ROOTFSTYPE="${KERNEL_ROOTFSTYPE:-crabfs}"
 KERNEL_CMDLINE="${KERNEL_CMDLINE:-}"
+ROOTFS_SIZE_MIB="${ROOTFS_SIZE_MIB:-}"
+EMPTY_ROOTFS_DIR=".empty-rootfs"
+
+resolve_rootfs_size_mib() {
+    local source_dir="$1"
+    if [ -n "$ROOTFS_SIZE_MIB" ]; then
+        printf '%s\n' "$ROOTFS_SIZE_MIB"
+        return
+    fi
+
+    local used_mib size_mib
+    used_mib="$(du -sm "$source_dir" | awk '{print $1}')"
+    size_mib=$((used_mib + used_mib / 4 + 256))
+    if [ "$size_mib" -lt 64 ]; then
+        size_mib=64
+    fi
+    printf '%s\n' "$size_mib"
+}
+
+build_rootfs_from_dir() {
+    local source_dir="$1"
+    local output_img="$2"
+    local host_target
+    local size_mib
+    host_target="$(rustc -vV | awk '/host:/ {print $2}')"
+    size_mib="$(resolve_rootfs_size_mib "$source_dir")"
+    cargo run --offline --manifest-path tools/mkrootfs/Cargo.toml --target "$host_target" \
+        --config 'unstable.build-std=["std","panic_abort"]' -- \
+        --source "$source_dir" \
+        --output "$output_img" \
+        --size-mib "$size_mib"
+}
+
+rootfs_has_crabfs_superblock() {
+    [ -f "$1" ] || return 1
+    [ "$(head -c 4 "$1" | xxd -p -c 4 2>/dev/null)" = "58465342" ]
+}
 
 if [ -n "$STAGE3_TARBALL" ]; then
     echo "Importing Gentoo stage3 into $ROOTFS_IMG..."
     ./tools/import_rootfs.sh "$STAGE3_TARBALL" "$STAGING_DIR" "$ROOTFS_IMG"
-elif [ ! -f "$ROOTFS_IMG" ]; then
-    echo "Creating placeholder rootfs image at $ROOTFS_IMG (64MiB)..."
-    dd if=/dev/zero of="$ROOTFS_IMG" bs=1048576 count=64 status=none
+elif [ -d "$STAGING_DIR" ]; then
+    echo "Packing existing rootfs tree from $STAGING_DIR into $ROOTFS_IMG..."
+    build_rootfs_from_dir "$STAGING_DIR" "$ROOTFS_IMG"
+elif ! rootfs_has_crabfs_superblock "$ROOTFS_IMG"; then
+    echo "Creating minimal crabfs rootfs image at $ROOTFS_IMG..."
+    rm -rf "$EMPTY_ROOTFS_DIR"
+    mkdir -p "$EMPTY_ROOTFS_DIR"
+    build_rootfs_from_dir "$EMPTY_ROOTFS_DIR" "$ROOTFS_IMG"
 fi
 
 # Create a temporary directory for the FAT-emulated Limine disk.

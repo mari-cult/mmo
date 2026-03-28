@@ -1,5 +1,3 @@
-.set SCHEDULER_STACK_SIZE, 16384
-
 .global restore_task_context
 .global timer_interrupt_entry
 
@@ -21,8 +19,6 @@ timer_interrupt_entry:
     push %r15
 
     mov %rsp, %rdi
-    lea SCHEDULER_STACK+SCHEDULER_STACK_SIZE(%rip), %rsp
-    and $-16, %rsp
     call scheduler_timer_tick
     mov %rax, %rdi
     jmp restore_task_context

@@ -132,9 +132,16 @@ pub fn allocate_and_map_page(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<PhysFrame<Size4KiB>, VmError> {
-    let frame = loop {
+    let frame = allocate_frame()?;
+
+    map_existing_page(page, frame, flags)?;
+    Ok(frame)
+}
+
+pub fn allocate_frame() -> Result<PhysFrame<Size4KiB>, VmError> {
+    loop {
         if let Some(frame) = try_allocate_frame()? {
-            break frame;
+            return Ok(frame);
         }
 
         let reclaimed = crate::reclaim::reclaim_one().map_err(|err| match err {
@@ -144,10 +151,16 @@ pub fn allocate_and_map_page(
         if !reclaimed {
             return Err(VmError::FrameAllocationFailed);
         }
-    };
+    }
+}
 
-    map_existing_page(page, frame, flags)?;
-    Ok(frame)
+pub fn zero_frame(frame: PhysFrame<Size4KiB>) -> Result<(), VmError> {
+    let offset = physical_memory_offset()?;
+    let ptr = (offset.as_u64() + frame.start_address().as_u64()) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, Size4KiB::SIZE as usize);
+    }
+    Ok(())
 }
 
 pub fn map_existing_page(
@@ -156,6 +169,23 @@ pub fn map_existing_page(
     flags: PageTableFlags,
 ) -> Result<(), VmError> {
     with_runtime(|mapper, frame_allocator| {
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, frame_allocator)
+                .map_err(map_error_to_vm)?
+                .flush();
+        }
+        Ok(())
+    })
+}
+
+pub fn map_existing_page_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), VmError> {
+    with_runtime_in(root_frame, |mapper, frame_allocator| {
         unsafe {
             mapper
                 .map_to(page, frame, flags, frame_allocator)
@@ -178,8 +208,35 @@ pub fn update_page_flags(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<
     })
 }
 
+pub fn update_page_flags_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), VmError> {
+    with_runtime_in(root_frame, |mapper, _frame_allocator| {
+        unsafe {
+            mapper
+                .update_flags(page, flags)
+                .map_err(flag_update_error_to_vm)?
+                .flush();
+        }
+        Ok(())
+    })
+}
+
 pub fn unmap_page(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, VmError> {
     with_runtime(|mapper, _frame_allocator| {
+        let (frame, flush) = mapper.unmap(page).map_err(unmap_error_to_vm)?;
+        flush.flush();
+        Ok(frame)
+    })
+}
+
+pub fn unmap_page_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+) -> Result<PhysFrame<Size4KiB>, VmError> {
+    with_runtime_in(root_frame, |mapper, _frame_allocator| {
         let (frame, flush) = mapper.unmap(page).map_err(unmap_error_to_vm)?;
         flush.flush();
         Ok(frame)
@@ -216,9 +273,26 @@ fn with_runtime<T>(
     f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let offset = physical_memory_offset()?;
+    let (root_frame, _) = x86_64::registers::control::Cr3::read();
+    with_runtime_in_with_offset(root_frame, offset, f)
+}
+
+fn with_runtime_in<T>(
+    root_frame: PhysFrame<Size4KiB>,
+    f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
+) -> Result<T, VmError> {
+    let offset = physical_memory_offset()?;
+    with_runtime_in_with_offset(root_frame, offset, f)
+}
+
+fn with_runtime_in_with_offset<T>(
+    root_frame: PhysFrame<Size4KiB>,
+    offset: VirtAddr,
+    f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
+) -> Result<T, VmError> {
     let mut guard = FRAME_ALLOCATOR.lock();
     let frame_allocator = guard.as_mut().ok_or(VmError::RuntimeNotInitialized)?;
-    let mut mapper = unsafe { paging::init(offset) };
+    let mut mapper = unsafe { paging::init_for_frame(offset, root_frame) };
     f(&mut mapper, frame_allocator)
 }
 

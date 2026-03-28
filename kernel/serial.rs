@@ -42,6 +42,18 @@ impl SerialPort {
             self.data.write(data);
         }
     }
+
+    pub fn received(&mut self) -> bool {
+        (unsafe { self.line_status.read() } & 0x01) != 0
+    }
+
+    pub fn receive(&mut self) -> Option<u8> {
+        if self.received() {
+            Some(unsafe { self.data.read() })
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Write for SerialPort {
@@ -79,4 +91,33 @@ pub fn _print(args: fmt::Arguments) {
         }
         serial.write_fmt(args).expect("Printing to serial failed");
     });
+}
+
+pub fn try_read_byte() -> Option<u8> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL1.lock();
+        if !SERIAL_READY.swap(true, Ordering::SeqCst) {
+            serial.init();
+        }
+        serial.receive()
+    })
+}
+
+pub fn has_input() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut serial = SERIAL1.lock();
+        if !SERIAL_READY.swap(true, Ordering::SeqCst) {
+            serial.init();
+        }
+        serial.received()
+    })
+}
+
+pub fn read_byte_blocking() -> u8 {
+    loop {
+        if let Some(byte) = try_read_byte() {
+            return byte;
+        }
+        core::hint::spin_loop();
+    }
 }

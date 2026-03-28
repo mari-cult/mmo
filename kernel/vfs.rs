@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use crate::virtio_blk::VirtioBlkDevice;
+use crate::serial;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -35,6 +36,7 @@ struct OpenFile {
     status_flags: i32,
     path: String,
     special: Option<SpecialFd>,
+    refs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,7 @@ impl Vfs {
             status_flags: 0,
             path: "/dev/stdin".to_string(),
             special: Some(SpecialFd::Stdin),
+            refs: 1,
         });
         files[1] = Some(OpenFile {
             ino: 0,
@@ -74,6 +77,7 @@ impl Vfs {
             status_flags: 0,
             path: "/dev/stdout".to_string(),
             special: Some(SpecialFd::Stdout),
+            refs: 1,
         });
         files[2] = Some(OpenFile {
             ino: 0,
@@ -82,6 +86,7 @@ impl Vfs {
             status_flags: 0,
             path: "/dev/stderr".to_string(),
             special: Some(SpecialFd::Stderr),
+            refs: 1,
         });
         Ok(Self {
             dev: d,
@@ -192,6 +197,7 @@ impl Vfs {
                 status_flags: flags,
                 path: path.to_string(),
                 special,
+                refs: 1,
             });
             return Ok(fd);
         }
@@ -206,17 +212,42 @@ impl Vfs {
             status_flags: flags,
             path: normalized,
             special: None,
+            refs: 1,
         });
         Ok(fd)
     }
 
     fn read(&mut self, fd: i32, out: &mut [u8]) -> Result<usize, VfsError> {
-        if matches!(
-            self.file(fd)?.special,
-            Some(SpecialFd::Stdin | SpecialFd::Tty | SpecialFd::Null)
-        ) {
-            let _ = out;
-            return Ok(0);
+        match self.file(fd)?.special {
+            Some(SpecialFd::Null) => {
+                let _ = out;
+                return Ok(0);
+            }
+            Some(SpecialFd::Stdin | SpecialFd::Tty) => {
+                if out.is_empty() {
+                    return Ok(0);
+                }
+                let mut n = 0usize;
+                while n < out.len() {
+                    let mut byte = if n == 0 {
+                        serial::read_byte_blocking()
+                    } else if let Some(byte) = serial::try_read_byte() {
+                        byte
+                    } else {
+                        break;
+                    };
+                    if byte == b'\r' {
+                        byte = b'\n';
+                    }
+                    out[n] = byte;
+                    n += 1;
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                return Ok(n);
+            }
+            _ => {}
         }
         let (ino, offset) = {
             let of = self.file_mut(fd)?;
@@ -233,11 +264,15 @@ impl Vfs {
     fn close(&mut self, fd: i32) -> Result<(), VfsError> {
         let slot = usize::try_from(fd).map_err(|_| VfsError::InvalidFd)?;
         let entry = self.files.get_mut(slot).ok_or(VfsError::InvalidFd)?;
-        if entry.take().is_some() {
-            Ok(())
+        let Some(file) = entry.as_mut() else {
+            return Err(VfsError::InvalidFd);
+        };
+        if file.refs > 1 {
+            file.refs -= 1;
         } else {
-            Err(VfsError::InvalidFd)
+            entry.take();
         }
+        Ok(())
     }
 
     fn fstat(&mut self, fd: i32) -> Result<FileStat, VfsError> {
@@ -383,6 +418,17 @@ impl Vfs {
         dup.fd_flags = if cloexec { 1 } else { 0 };
         self.files[slot] = Some(dup);
         Ok(slot as i32)
+    }
+
+    fn clone_handle(&mut self, fd: i32) -> Result<i32, VfsError> {
+        let slot = usize::try_from(fd).map_err(|_| VfsError::InvalidFd)?;
+        let file = self
+            .files
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or(VfsError::InvalidFd)?;
+        file.refs = file.refs.saturating_add(1);
+        Ok(fd)
     }
 
     fn dup2_fd(&mut self, oldfd: i32, newfd: i32, cloexec: bool) -> Result<i32, VfsError> {
@@ -562,6 +608,12 @@ pub fn dup_fd(fd: i32, min_fd: i32, cloexec: bool) -> Result<i32, VfsError> {
     let mut g = VFS.lock();
     let v = g.as_mut().ok_or(VfsError::NotMounted)?;
     v.dup_fd(fd, min_fd, cloexec)
+}
+
+pub fn clone_handle(fd: i32) -> Result<i32, VfsError> {
+    let mut g = VFS.lock();
+    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+    v.clone_handle(fd)
 }
 
 pub fn dup2_fd(oldfd: i32, newfd: i32, cloexec: bool) -> Result<i32, VfsError> {
