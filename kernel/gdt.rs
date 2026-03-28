@@ -31,9 +31,8 @@ struct Selectors {
     tss_selector: SegmentSelector,
 }
 
-static CPU_GDTS: Lazy<Mutex<Vec<Option<CpuGdt>>>> = Lazy::new(|| {
-    Mutex::new(core::iter::repeat_with(|| None).take(MAX_CPUS).collect())
-});
+static CPU_GDTS: Lazy<Mutex<Vec<Option<CpuGdt>>>> =
+    Lazy::new(|| Mutex::new(core::iter::repeat_with(|| None).take(MAX_CPUS).collect()));
 
 fn build_cpu_gdt() -> CpuGdt {
     let privilege_stack = Box::leak(Box::new([0; STACK_SIZE]));
