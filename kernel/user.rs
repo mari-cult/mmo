@@ -287,6 +287,10 @@ fn with_current_address_space<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> T {
 
 fn current_mappings() -> Vec<UserMapping> {
     let asid = current_address_space_id();
+    address_space_mappings(asid)
+}
+
+fn address_space_mappings(asid: u32) -> Vec<UserMapping> {
     let registry = REGISTRY.lock();
     registry
         .spaces
@@ -356,19 +360,44 @@ fn switch_address_space(asid: u32) -> Result<(), UserError> {
 }
 
 fn destroy_current_image() -> Result<(), UserError> {
-    let mappings = current_mappings();
-    let root_frame = current_root_frame()?;
+    destroy_address_space_contents(current_address_space_id())
+}
+
+fn destroy_address_space_contents(asid: u32) -> Result<(), UserError> {
+    let mappings = address_space_mappings(asid);
+    let root_frame = {
+        let registry = REGISTRY.lock();
+        registry
+            .spaces
+            .get(&asid)
+            .map(|space| space.root_frame)
+            .ok_or(UserError::Vm)?
+    };
     for mapping in mappings {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(mapping.start));
         if let Ok(frame) = allocator::unmap_page_in(root_frame, page) {
             let _ = allocator::deallocate_frame(frame);
         }
     }
-    with_current_address_space(|space| {
+    with_address_space(asid, |space| {
         space.mappings.clear();
         space.brk = USER_BRK_BASE;
         space.next_mmap_base = USER_MMAP_BASE;
     });
+    Ok(())
+}
+
+fn destroy_address_space(asid: u32) -> Result<(), UserError> {
+    destroy_address_space_contents(asid)?;
+    let root_frame = {
+        let mut registry = REGISTRY.lock();
+        registry
+            .spaces
+            .remove(&asid)
+            .map(|space| space.root_frame)
+            .ok_or(UserError::Vm)?
+    };
+    let _ = allocator::deallocate_frame(root_frame);
     Ok(())
 }
 
@@ -428,7 +457,9 @@ fn frame_bytes(frame: PhysFrame<Size4KiB>) -> Result<*mut u8, UserError> {
     Ok((offset.as_u64() + frame.start_address().as_u64()) as *mut u8)
 }
 
-fn duplicate_mappings(src: &BTreeMap<u64, UserMapping>) -> Result<BTreeMap<u64, UserMapping>, UserError> {
+fn duplicate_mappings(
+    src: &BTreeMap<u64, UserMapping>,
+) -> Result<BTreeMap<u64, UserMapping>, UserError> {
     let mut out = BTreeMap::new();
     for (virt, mapping) in src {
         let frame = allocator::allocate_frame().map_err(|_| UserError::Vm)?;
@@ -501,7 +532,10 @@ fn reap_child(pid: i32) -> Result<Option<(u32, i32)>, UserError> {
         }
         let status = proc.exit_status;
         registry.by_pid.remove(&child_pid);
-        current_slot().lock().children.retain(|candidate| *candidate != child_pid);
+        current_slot()
+            .lock()
+            .children
+            .retain(|candidate| *candidate != child_pid);
         if let Some(parent) = registry.by_pid.get_mut(&self_pid) {
             parent.children.retain(|candidate| *candidate != child_pid);
         }
@@ -643,19 +677,54 @@ pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, Use
     Ok(task)
 }
 
-pub fn execve(path: &str, argv: &[&str], envp: &[&str]) -> Result<process::SavedTaskContext, UserError> {
-    destroy_current_image()?;
-    let ctx = load_exec_context(
-        current_task_id().ok_or(UserError::Unsupported)?,
-        current_pid_internal(),
-        path,
-        argv,
-        envp,
-    )?;
+pub fn execve(
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<process::SavedTaskContext, UserError> {
+    let pid = current_pid_internal();
+    let task_id = current_task_id().ok_or(UserError::Unsupported)?;
+    let (old_asid, old_init_path) = {
+        let state = current_slot().lock();
+        (state.address_space_id, state.init_path.clone())
+    };
+    let new_asid = {
+        let mut registry = REGISTRY.lock();
+        let asid = allocate_address_space_id(&mut registry);
+        let space = create_address_space()?;
+        registry.spaces.insert(asid, space);
+        asid
+    };
+
+    {
+        let mut state = current_slot().lock();
+        state.address_space_id = new_asid;
+    }
+    switch_address_space(new_asid)?;
+
+    let ctx = match load_exec_context(task_id, pid, path, argv, envp) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            {
+                let mut state = current_slot().lock();
+                state.address_space_id = old_asid;
+                state.init_path = old_init_path;
+            }
+            let _ = switch_address_space(old_asid);
+            let _ = destroy_address_space(new_asid);
+            return Err(err);
+        }
+    };
+
+    destroy_address_space(old_asid)?;
+    REGISTRY
+        .lock()
+        .by_pid
+        .insert(pid, current_slot().lock().clone());
     kdebug!(
         "USER: execve path={} pid={} rip={:#x} rsp={:#x}",
         path,
-        current_pid_internal(),
+        pid,
         ctx.rip,
         ctx.rsp
     );
@@ -800,8 +869,12 @@ fn alloc_fd_slot(min_fd: i32) -> Result<usize, UserError> {
 
 pub fn open_fd(path: &str, flags: i32) -> Result<i32, UserError> {
     let handle = vfs::open(path, flags).map_err(|_| UserError::Vfs)?;
-    let slot = alloc_fd_slot(0)?;
-    current_slot().lock().fd_table[slot] = Some(UserFd { handle, fd_flags: 0 });
+    install_fd(handle, 0, 0)
+}
+
+pub fn install_fd(handle: i32, min_fd: i32, fd_flags: i32) -> Result<i32, UserError> {
+    let slot = alloc_fd_slot(min_fd)?;
+    current_slot().lock().fd_table[slot] = Some(UserFd { handle, fd_flags });
     Ok(slot as i32)
 }
 
@@ -1016,7 +1089,14 @@ fn load_exec_context(
         let q3 = unsafe { *((stack.rsp + 24) as *const u64) };
         ktrace!(
             "USER-STACK rsp={:#x} argc={} argv_ptr={:#x} envp_ptr={:#x} q0={:#x} q1={:#x} q2={:#x} q3={:#x}",
-            stack.rsp, stack.argc, stack.argv_ptr, stack.envp_ptr, q0, q1, q2, q3
+            stack.rsp,
+            stack.argc,
+            stack.argv_ptr,
+            stack.envp_ptr,
+            q0,
+            q1,
+            q2,
+            q3
         );
     }
 

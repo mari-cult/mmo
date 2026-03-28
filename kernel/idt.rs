@@ -65,7 +65,7 @@ pub fn load_local() {
 }
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
-    panic!("EXCEPTION: DIVIDE ERROR\n{:#?}", stack_frame);
+    handle_fault("DIVIDE ERROR", &stack_frame, None, 136);
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -73,7 +73,7 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+    handle_fault("INVALID OPCODE", &stack_frame, None, 132);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -87,10 +87,11 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    panic!(
-        "EXCEPTION: GENERAL PROTECTION FAULT err={:#x}\n{:#?}",
-        error_code,
-        stack_frame
+    handle_fault(
+        "GENERAL PROTECTION FAULT",
+        &stack_frame,
+        Some(format_args!("Error Code: {:#x}", error_code)),
+        139,
     );
 }
 
@@ -103,11 +104,15 @@ extern "x86-interrupt" fn page_fault_handler(
     if let Ok(true) = crate::reclaim::handle_page_fault(fault_addr) {
         return;
     }
-    println!("EXCEPTION: PAGE FAULT");
-    println!("Accessed Address: {:?}", fault_addr);
-    println!("Error Code: {:?}", error_code);
-    println!("{:#?}", stack_frame);
-    panic!("Page Fault");
+    handle_fault(
+        "PAGE FAULT",
+        &stack_frame,
+        Some(format_args!(
+            "Accessed Address: {:?}\nError Code: {:?}",
+            fault_addr, error_code
+        )),
+        139,
+    );
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
@@ -123,4 +128,64 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
 extern "x86-interrupt" fn apic_spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
     crate::apic::complete_interrupt();
+}
+
+fn handle_fault(
+    name: &str,
+    stack_frame: &InterruptStackFrame,
+    extra: Option<core::fmt::Arguments<'_>>,
+    status: i32,
+) -> ! {
+    if is_user_fault(stack_frame) {
+        log_user_fault(name, stack_frame, extra);
+        crate::user::exit_current(status);
+        crate::process::on_task_exit()
+    } else {
+        log_kernel_fault(name, stack_frame, extra);
+        panic!("{}", name);
+    }
+}
+
+fn is_user_fault(stack_frame: &InterruptStackFrame) -> bool {
+    (stack_frame.code_segment.0 & 0x3) == 0x3
+}
+
+fn log_user_fault(
+    name: &str,
+    stack_frame: &InterruptStackFrame,
+    extra: Option<core::fmt::Arguments<'_>>,
+) {
+    println!("USER EXCEPTION: {}", name);
+    println!(
+        "pid={} task={} exe={}",
+        crate::user::pid(),
+        crate::process::current_task_id().unwrap_or(0),
+        crate::user::current_init_path()
+            .as_deref()
+            .unwrap_or("<unknown>")
+    );
+    if let Some(extra) = extra {
+        println!("{}", extra);
+    }
+    println!(
+        "rip={:?} rsp={:?} cs={:#x} ss={:#x} rflags={:#x}",
+        stack_frame.instruction_pointer,
+        stack_frame.stack_pointer,
+        stack_frame.code_segment.0,
+        stack_frame.stack_segment.0,
+        stack_frame.cpu_flags.bits()
+    );
+    println!("{:#?}", stack_frame);
+}
+
+fn log_kernel_fault(
+    name: &str,
+    stack_frame: &InterruptStackFrame,
+    extra: Option<core::fmt::Arguments<'_>>,
+) {
+    println!("EXCEPTION: {}", name);
+    if let Some(extra) = extra {
+        println!("{}", extra);
+    }
+    println!("{:#?}", stack_frame);
 }

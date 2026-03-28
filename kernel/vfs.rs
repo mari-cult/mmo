@@ -1,8 +1,9 @@
 extern crate alloc;
 
-use crate::virtio_blk::VirtioBlkDevice;
+use crate::print;
 use crate::serial;
-use alloc::collections::{BTreeMap, BTreeSet};
+use crate::virtio_blk::VirtioBlkDevice;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use crabfs::on_disk::superblock::Superblock;
@@ -10,6 +11,11 @@ use crabfs::reader;
 use spin::{Lazy, Mutex};
 
 const FILE_MAX_SLOTS: usize = 64;
+const PIPE_CAPACITY: usize = 65536;
+pub const POLLIN: i16 = 0x0001;
+pub const POLLOUT: i16 = 0x0004;
+pub const POLLERR: i16 = 0x0008;
+pub const POLLHUP: i16 = 0x0010;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsError {
@@ -19,6 +25,8 @@ pub enum VfsError {
     InvalidPath,
     Io,
     InvalidFd,
+    WouldBlock,
+    BrokenPipe,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,12 +54,23 @@ enum SpecialFd {
     Stderr,
     Tty,
     Null,
+    PipeRead(u32),
+    PipeWrite(u32),
+}
+
+#[derive(Debug, Default)]
+struct Pipe {
+    buf: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
 }
 
 pub struct Vfs {
     dev: VirtioBlkDevice,
     sb: Superblock,
     files: Vec<Option<OpenFile>>,
+    pipes: BTreeMap<u32, Pipe>,
+    next_pipe_id: u32,
     path_cache: BTreeMap<String, u64>,
     negative_path_cache: BTreeSet<String>,
 }
@@ -92,6 +111,8 @@ impl Vfs {
             dev: d,
             sb,
             files,
+            pipes: BTreeMap::new(),
+            next_pipe_id: 1,
             path_cache: BTreeMap::new(),
             negative_path_cache: BTreeSet::new(),
         })
@@ -239,6 +260,7 @@ impl Vfs {
                     if byte == b'\r' {
                         byte = b'\n';
                     }
+                    serial::echo_input_byte(byte);
                     out[n] = byte;
                     n += 1;
                     if byte == b'\n' {
@@ -247,6 +269,10 @@ impl Vfs {
                 }
                 return Ok(n);
             }
+            Some(SpecialFd::PipeRead(pipe_id)) => {
+                return self.read_pipe(pipe_id, out);
+            }
+            Some(SpecialFd::PipeWrite(_)) => return Err(VfsError::InvalidFd),
             _ => {}
         }
         let (ino, offset) = {
@@ -261,6 +287,26 @@ impl Vfs {
         Ok(n)
     }
 
+    fn write(&mut self, fd: i32, data: &[u8]) -> Result<usize, VfsError> {
+        match self.file(fd)?.special {
+            Some(SpecialFd::Stdin) => Err(VfsError::InvalidFd),
+            Some(SpecialFd::Stdout | SpecialFd::Stderr | SpecialFd::Tty) => {
+                if let Ok(s) = core::str::from_utf8(data) {
+                    print!("{}", s);
+                } else {
+                    for b in data {
+                        print!("{}", *b as char);
+                    }
+                }
+                Ok(data.len())
+            }
+            Some(SpecialFd::Null) => Ok(data.len()),
+            Some(SpecialFd::PipeWrite(pipe_id)) => self.write_pipe(pipe_id, data),
+            Some(SpecialFd::PipeRead(_)) => Err(VfsError::InvalidFd),
+            None => Err(VfsError::InvalidFd),
+        }
+    }
+
     fn close(&mut self, fd: i32) -> Result<(), VfsError> {
         let slot = usize::try_from(fd).map_err(|_| VfsError::InvalidFd)?;
         let entry = self.files.get_mut(slot).ok_or(VfsError::InvalidFd)?;
@@ -270,12 +316,24 @@ impl Vfs {
         if file.refs > 1 {
             file.refs -= 1;
         } else {
+            let special = file.special;
             entry.take();
+            self.release_special(special);
         }
         Ok(())
     }
 
     fn fstat(&mut self, fd: i32) -> Result<FileStat, VfsError> {
+        if matches!(
+            self.file(fd)?.special,
+            Some(SpecialFd::PipeRead(_) | SpecialFd::PipeWrite(_))
+        ) {
+            return Ok(FileStat {
+                ino: 0,
+                mode: 0o10600,
+                size: 0,
+            });
+        }
         if self.file(fd)?.special.is_some() {
             return Ok(FileStat {
                 ino: 0,
@@ -384,6 +442,42 @@ impl Vfs {
         Ok(matches!(self.file(fd)?.special, Some(SpecialFd::Null)))
     }
 
+    fn poll_mask(&self, fd: i32) -> Result<i16, VfsError> {
+        match self.file(fd)?.special {
+            Some(SpecialFd::Stdin | SpecialFd::Tty) => {
+                let mut mask = 0;
+                if serial::has_input() {
+                    mask |= POLLIN;
+                }
+                mask |= POLLOUT;
+                Ok(mask)
+            }
+            Some(SpecialFd::Stdout | SpecialFd::Stderr | SpecialFd::Null) => Ok(POLLOUT),
+            Some(SpecialFd::PipeRead(pipe_id)) => {
+                let pipe = self.pipes.get(&pipe_id).ok_or(VfsError::InvalidFd)?;
+                let mut mask = 0;
+                if !pipe.buf.is_empty() {
+                    mask |= POLLIN;
+                }
+                if pipe.writers == 0 {
+                    mask |= POLLHUP;
+                }
+                Ok(mask)
+            }
+            Some(SpecialFd::PipeWrite(pipe_id)) => {
+                let pipe = self.pipes.get(&pipe_id).ok_or(VfsError::InvalidFd)?;
+                let mut mask = 0;
+                if pipe.readers == 0 {
+                    mask |= POLLERR;
+                } else if pipe.buf.len() < PIPE_CAPACITY {
+                    mask |= POLLOUT;
+                }
+                Ok(mask)
+            }
+            None => Ok(POLLIN | POLLOUT),
+        }
+    }
+
     fn get_fd_flags(&self, fd: i32) -> Result<i32, VfsError> {
         Ok(self.file(fd)?.fd_flags)
     }
@@ -489,6 +583,118 @@ impl Vfs {
             .position(|entry| entry.is_none())
             .ok_or(VfsError::InvalidFd)
     }
+
+    fn alloc_fd_slot_from(&self, start: usize) -> Result<usize, VfsError> {
+        self.files
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(idx, entry)| entry.is_none().then_some(idx))
+            .ok_or(VfsError::InvalidFd)
+    }
+
+    fn create_pipe(&mut self) -> Result<(i32, i32), VfsError> {
+        let rslot = self.alloc_fd_slot()?;
+        let wslot = self.alloc_fd_slot_from(rslot + 1)?;
+        let pipe_id = self.next_pipe_id;
+        self.next_pipe_id = self.next_pipe_id.wrapping_add(1).max(1);
+        self.pipes.insert(
+            pipe_id,
+            Pipe {
+                buf: VecDeque::with_capacity(256),
+                readers: 1,
+                writers: 1,
+            },
+        );
+        self.files[rslot] = Some(OpenFile {
+            ino: 0,
+            offset: 0,
+            fd_flags: 0,
+            status_flags: 0,
+            path: "[pipe]".to_string(),
+            special: Some(SpecialFd::PipeRead(pipe_id)),
+            refs: 1,
+        });
+        self.files[wslot] = Some(OpenFile {
+            ino: 0,
+            offset: 0,
+            fd_flags: 0,
+            status_flags: 1,
+            path: "[pipe]".to_string(),
+            special: Some(SpecialFd::PipeWrite(pipe_id)),
+            refs: 1,
+        });
+        Ok((rslot as i32, wslot as i32))
+    }
+
+    fn read_pipe(&mut self, pipe_id: u32, out: &mut [u8]) -> Result<usize, VfsError> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let pipe = self.pipes.get_mut(&pipe_id).ok_or(VfsError::InvalidFd)?;
+        if pipe.buf.is_empty() {
+            return if pipe.writers == 0 {
+                Ok(0)
+            } else {
+                Err(VfsError::WouldBlock)
+            };
+        }
+        let mut n = 0usize;
+        while n < out.len() {
+            let Some(byte) = pipe.buf.pop_front() else {
+                break;
+            };
+            out[n] = byte;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn write_pipe(&mut self, pipe_id: u32, data: &[u8]) -> Result<usize, VfsError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let pipe = self.pipes.get_mut(&pipe_id).ok_or(VfsError::InvalidFd)?;
+        if pipe.readers == 0 {
+            return Err(VfsError::BrokenPipe);
+        }
+        if pipe.buf.len() >= PIPE_CAPACITY {
+            return Err(VfsError::WouldBlock);
+        }
+        let max_write = core::cmp::min(data.len(), PIPE_CAPACITY - pipe.buf.len());
+        for byte in &data[..max_write] {
+            pipe.buf.push_back(*byte);
+        }
+        Ok(max_write)
+    }
+
+    fn release_special(&mut self, special: Option<SpecialFd>) {
+        match special {
+            Some(SpecialFd::PipeRead(pipe_id)) => {
+                let remove = if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+                    pipe.readers = pipe.readers.saturating_sub(1);
+                    pipe.readers == 0 && pipe.writers == 0
+                } else {
+                    false
+                };
+                if remove {
+                    self.pipes.remove(&pipe_id);
+                }
+            }
+            Some(SpecialFd::PipeWrite(pipe_id)) => {
+                let remove = if let Some(pipe) = self.pipes.get_mut(&pipe_id) {
+                    pipe.writers = pipe.writers.saturating_sub(1);
+                    pipe.readers == 0 && pipe.writers == 0
+                } else {
+                    false
+                };
+                if remove {
+                    self.pipes.remove(&pipe_id);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub static VFS: Lazy<Mutex<Option<Vfs>>> = Lazy::new(|| Mutex::new(None));
@@ -511,9 +717,37 @@ pub fn open(path: &str, flags: i32) -> Result<i32, VfsError> {
 }
 
 pub fn read(fd: i32, out: &mut [u8]) -> Result<usize, VfsError> {
-    let mut g = VFS.lock();
-    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
-    v.read(fd, out)
+    loop {
+        let result = {
+            let mut g = VFS.lock();
+            let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+            v.read(fd, out)
+        };
+        match result {
+            Err(VfsError::WouldBlock) => {
+                crate::process::yield_current();
+                core::hint::spin_loop();
+            }
+            other => return other,
+        }
+    }
+}
+
+pub fn write(fd: i32, data: &[u8]) -> Result<usize, VfsError> {
+    loop {
+        let result = {
+            let mut g = VFS.lock();
+            let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+            v.write(fd, data)
+        };
+        match result {
+            Err(VfsError::WouldBlock) => {
+                crate::process::yield_current();
+                core::hint::spin_loop();
+            }
+            other => return other,
+        }
+    }
 }
 
 pub fn close(fd: i32) -> Result<(), VfsError> {
@@ -598,6 +832,12 @@ pub fn is_special_null(fd: i32) -> Result<bool, VfsError> {
     v.is_special_null(fd)
 }
 
+pub fn poll_mask(fd: i32) -> Result<i16, VfsError> {
+    let g = VFS.lock();
+    let v = g.as_ref().ok_or(VfsError::NotMounted)?;
+    v.poll_mask(fd)
+}
+
 pub fn set_status_flags(fd: i32, flags: i32) -> Result<(), VfsError> {
     let mut g = VFS.lock();
     let v = g.as_mut().ok_or(VfsError::NotMounted)?;
@@ -614,6 +854,12 @@ pub fn clone_handle(fd: i32) -> Result<i32, VfsError> {
     let mut g = VFS.lock();
     let v = g.as_mut().ok_or(VfsError::NotMounted)?;
     v.clone_handle(fd)
+}
+
+pub fn create_pipe() -> Result<(i32, i32), VfsError> {
+    let mut g = VFS.lock();
+    let v = g.as_mut().ok_or(VfsError::NotMounted)?;
+    v.create_pipe()
 }
 
 pub fn dup2_fd(oldfd: i32, newfd: i32, cloexec: bool) -> Result<i32, VfsError> {
