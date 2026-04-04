@@ -4,10 +4,10 @@ use crate::arch::{
     FlagUpdateError, FrameAllocator, MapToError, Mapper as _, OffsetPageTable, Page, PageSize,
     PageTableFlags, PhysAddr, PhysFrame, Size4KiB, UnmapError, VirtAddr,
 };
+use crate::limine::{MEMMAP_REQUEST_ID, Request};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use limine_sys::*;
-use crate::limine::{Request, MEMMAP_REQUEST_ID};
 use spin::{Lazy, Mutex};
 
 pub struct BootInfoFrameAllocator {
@@ -25,7 +25,10 @@ impl BootInfoFrameAllocator {
 
     pub fn init_from_limine(response: &'static limine_memmap_response) -> Self {
         let entries = unsafe {
-            core::slice::from_raw_parts(response.entries as *const &limine_memmap_entry, response.entry_count as usize)
+            core::slice::from_raw_parts(
+                response.entries as *const &limine_memmap_entry,
+                response.entry_count as usize,
+            )
         };
         BootInfoFrameAllocator {
             memory_map: entries,
@@ -70,7 +73,12 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 }
 
 pub fn deallocate_frame(frame: PhysFrame) -> Result<(), VmError> {
-    FRAME_ALLOCATOR.lock().as_mut().unwrap().recycled.push(frame);
+    FRAME_ALLOCATOR
+        .lock()
+        .as_mut()
+        .unwrap()
+        .recycled
+        .push(frame);
     Ok(())
 }
 
@@ -161,7 +169,10 @@ pub fn allocate_frame() -> Result<PhysFrame<Size4KiB>, VmError> {
     try_allocate_frame()?.ok_or(VmError::FrameAllocationFailed)
 }
 
-pub fn allocate_and_map_page(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<PhysFrame<Size4KiB>, VmError> {
+pub fn allocate_and_map_page(
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<PhysFrame<Size4KiB>, VmError> {
     let frame = allocate_frame()?;
     with_runtime(|mapper, frame_allocator| {
         unsafe {
@@ -184,7 +195,11 @@ pub fn runtime_ready() -> bool {
     PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst) != 0
 }
 
-pub fn map_existing_page(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFlags) -> Result<(), VmError> {
+pub fn map_existing_page(
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), VmError> {
     with_runtime(|mapper, frame_allocator| {
         unsafe {
             mapper.map_to(page, frame, flags, frame_allocator)?.flush();
@@ -193,7 +208,12 @@ pub fn map_existing_page(page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags
     })
 }
 
-pub fn map_existing_page_in(root_frame: PhysFrame<Size4KiB>, page: Page<Size4KiB>, frame: PhysFrame<Size4KiB>, flags: PageTableFlags) -> Result<(), VmError> {
+pub fn map_existing_page_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), VmError> {
     with_runtime_in(root_frame, |mapper, frame_allocator| {
         unsafe {
             mapper.map_to(page, frame, flags, frame_allocator)?.flush();
@@ -202,7 +222,10 @@ pub fn map_existing_page_in(root_frame: PhysFrame<Size4KiB>, page: Page<Size4KiB
     })
 }
 
-pub fn unmap_page_in(root_frame: PhysFrame<Size4KiB>, page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, VmError> {
+pub fn unmap_page_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+) -> Result<PhysFrame<Size4KiB>, VmError> {
     with_runtime_in(root_frame, |mapper, _| {
         let (frame, flush) = mapper.unmap(page)?;
         flush.flush();
@@ -210,7 +233,11 @@ pub fn unmap_page_in(root_frame: PhysFrame<Size4KiB>, page: Page<Size4KiB>) -> R
     })
 }
 
-pub fn update_page_flags_in(root_frame: PhysFrame<Size4KiB>, page: Page<Size4KiB>, flags: PageTableFlags) -> Result<(), VmError> {
+pub fn update_page_flags_in(
+    root_frame: PhysFrame<Size4KiB>,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), VmError> {
     with_runtime_in(root_frame, |mapper, _| {
         let flush = unsafe { mapper.update_flags(page, flags)? };
         flush.flush();

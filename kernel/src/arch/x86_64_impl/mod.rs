@@ -22,7 +22,8 @@ pub type VirtAddr = x86_64::VirtAddr;
 pub type PhysAddr = x86_64::PhysAddr;
 
 pub use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size4KiB,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
+    Size4KiB,
     mapper::{FlagUpdateError, MapToError, UnmapError},
 };
 

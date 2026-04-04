@@ -1,9 +1,9 @@
+use crate::limine::{MP_REQUEST_ID, Request};
 use crate::println;
 use core::arch::asm;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use limine_sys::*;
-use crate::limine::{Request, MP_REQUEST_ID};
 
 pub const MAX_CPUS: usize = 32;
 const AP_BOOT_SPINS: usize = 2_000_000;
@@ -63,9 +63,7 @@ pub fn init() -> CpuTopology {
         let online = ONLINE_CPUS.load(Ordering::SeqCst).min(discovered);
         println!(
             "SMP: Limine MP discovered {} CPUs, {} online, BSP lapic_id={}",
-            discovered,
-            online,
-            response.bsp_lapic_id
+            discovered, online, response.bsp_lapic_id
         );
 
         CpuTopology {

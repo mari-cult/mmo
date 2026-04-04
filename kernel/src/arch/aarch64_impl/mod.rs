@@ -124,31 +124,49 @@ pub struct SavedTaskContext {
 
 // Aliases for core logic that assumes x86 names for now
 impl SavedTaskContext {
-    pub fn rip(&self) -> usize { self.elr }
-    pub fn rsp(&self) -> usize { self.sp }
-    pub fn rax(&self) -> usize { self.x0 }
+    pub fn rip(&self) -> usize {
+        self.elr
+    }
+    pub fn rsp(&self) -> usize {
+        self.sp
+    }
+    pub fn rax(&self) -> usize {
+        self.x0
+    }
 }
 
 pub mod gdt {
     pub struct SegmentSelector(pub u16);
-    pub fn user_code_selector() -> SegmentSelector { SegmentSelector(0) }
-    pub fn user_data_selector() -> SegmentSelector { SegmentSelector(0) }
+    pub fn user_code_selector() -> SegmentSelector {
+        SegmentSelector(0)
+    }
+    pub fn user_data_selector() -> SegmentSelector {
+        SegmentSelector(0)
+    }
     pub const DOUBLE_FAULT_IST_INDEX: u8 = 0;
 }
 
 impl gdt::SegmentSelector {
-    pub fn as_u16(self) -> u16 { self.0 }
-    pub const fn zero() -> Self { Self(0) }
+    pub fn as_u16(self) -> u16 {
+        self.0
+    }
+    pub const fn zero() -> Self {
+        Self(0)
+    }
 }
 
 pub mod smp {
     pub const MAX_CPUS: usize = 1;
-    pub fn current_cpu() -> usize { 0 }
+    pub fn current_cpu() -> usize {
+        0
+    }
 }
 
 pub mod apic {
     pub fn complete_interrupt() {}
-    pub fn current_lapic_id() -> Option<u32> { None }
+    pub fn current_lapic_id() -> Option<u32> {
+        None
+    }
 }
 
 pub mod pci {
@@ -181,11 +199,21 @@ pub mod pci {
         pub id: u8,
         pub offset: u8,
     }
-    pub fn read_config_dword(_addr: PciAddress, _offset: u8) -> u32 { 0 }
-    pub fn read_config_byte(_addr: PciAddress, _offset: u8) -> u8 { 0 }
-    pub fn scan_bus0() -> [Option<PciDevice>; 32] { [None; 32] }
-    pub fn capabilities(_addr: PciAddress) -> [Option<PciCapability>; 32] { [None; 32] }
-    pub fn map_mmio(_phys_addr: u64, _length: u64) -> Result<VirtAddr, ()> { Ok(VirtAddr::new(0)) }
+    pub fn read_config_dword(_addr: PciAddress, _offset: u8) -> u32 {
+        0
+    }
+    pub fn read_config_byte(_addr: PciAddress, _offset: u8) -> u8 {
+        0
+    }
+    pub fn scan_bus0() -> [Option<PciDevice>; 32] {
+        [None; 32]
+    }
+    pub fn capabilities(_addr: PciAddress) -> [Option<PciCapability>; 32] {
+        [None; 32]
+    }
+    pub fn map_mmio(_phys_addr: u64, _length: u64) -> Result<VirtAddr, ()> {
+        Ok(VirtAddr::new(0))
+    }
 }
 
 pub trait PageSize: Clone + PartialOrd + Ord {
@@ -273,27 +301,57 @@ bitflags::bitflags! {
 
 pub mod paging {
     use super::*;
-    pub unsafe fn init(_hhdm_offset: VirtAddr) -> OffsetPageTable { OffsetPageTable }
-    pub unsafe fn init_for_frame(_offset: VirtAddr, _root: PhysFrame) -> OffsetPageTable { OffsetPageTable }
+    pub unsafe fn init(_hhdm_offset: VirtAddr) -> OffsetPageTable {
+        OffsetPageTable
+    }
+    pub unsafe fn init_for_frame(_offset: VirtAddr, _root: PhysFrame) -> OffsetPageTable {
+        OffsetPageTable
+    }
     pub unsafe fn copy_kernel_mappings(_new: &mut PageTable, _old: &PageTable) {}
     pub unsafe fn switch_to(_frame: PhysFrame) {}
 }
 
 pub struct OffsetPageTable;
 pub trait Mapper<S: PageSize> {
-    fn map_to(&mut self, page: Page<S>, frame: PhysFrame<S>, flags: PageTableFlags, alloc: &mut impl FrameAllocator<S>) -> Result<MapperFlush<S>, MapToError<S>>;
+    fn map_to(
+        &mut self,
+        page: Page<S>,
+        frame: PhysFrame<S>,
+        flags: PageTableFlags,
+        alloc: &mut impl FrameAllocator<S>,
+    ) -> Result<MapperFlush<S>, MapToError<S>>;
     fn unmap(&mut self, page: Page<S>) -> Result<(PhysFrame<S>, MapperFlush<S>), UnmapError>;
-    unsafe fn update_flags(&mut self, page: Page<S>, flags: PageTableFlags) -> Result<MapperFlush<S>, FlagUpdateError>;
+    unsafe fn update_flags(
+        &mut self,
+        page: Page<S>,
+        flags: PageTableFlags,
+    ) -> Result<MapperFlush<S>, FlagUpdateError>;
 }
 
 impl<S: PageSize> Mapper<S> for OffsetPageTable {
-    fn map_to(&mut self, _page: Page<S>, _frame: PhysFrame<S>, _flags: PageTableFlags, _alloc: &mut impl FrameAllocator<S>) -> Result<MapperFlush<S>, MapToError<S>> {
+    fn map_to(
+        &mut self,
+        _page: Page<S>,
+        _frame: PhysFrame<S>,
+        _flags: PageTableFlags,
+        _alloc: &mut impl FrameAllocator<S>,
+    ) -> Result<MapperFlush<S>, MapToError<S>> {
         Ok(MapperFlush(PhantomData))
     }
     fn unmap(&mut self, _page: Page<S>) -> Result<(PhysFrame<S>, MapperFlush<S>), UnmapError> {
-        Ok((PhysFrame { start_address: PhysAddr::new(0), _phantom: PhantomData }, MapperFlush(PhantomData)))
+        Ok((
+            PhysFrame {
+                start_address: PhysAddr::new(0),
+                _phantom: PhantomData,
+            },
+            MapperFlush(PhantomData),
+        ))
     }
-    unsafe fn update_flags(&mut self, _page: Page<S>, _flags: PageTableFlags) -> Result<MapperFlush<S>, FlagUpdateError> {
+    unsafe fn update_flags(
+        &mut self,
+        _page: Page<S>,
+        _flags: PageTableFlags,
+    ) -> Result<MapperFlush<S>, FlagUpdateError> {
         Ok(MapperFlush(PhantomData))
     }
 }
@@ -324,19 +382,27 @@ pub enum FlagUpdateError {
 #[repr(C, align(4096))]
 pub struct PageTable([u64; 512]);
 impl PageTable {
-    pub fn clone(&self) -> Self { Self(self.0) }
+    pub fn clone(&self) -> Self {
+        Self(self.0)
+    }
 }
 impl core::ops::Index<usize> for PageTable {
     type Output = u64;
-    fn index(&self, index: usize) -> &u64 { &self.0[index] }
+    fn index(&self, index: usize) -> &u64 {
+        &self.0[index]
+    }
 }
 impl core::ops::IndexMut<usize> for PageTable {
-    fn index_mut(&mut self, index: usize) -> &mut u64 { &mut self.0[index] }
+    fn index_mut(&mut self, index: usize) -> &mut u64 {
+        &mut self.0[index]
+    }
 }
 
 pub fn init_paging(_hhdm_offset: u64) {}
 pub fn init_hardware() {}
-pub fn init_smp() -> usize { 1 }
+pub fn init_smp() -> usize {
+    1
+}
 
 pub fn without_interrupts<F, R>(f: F) -> R
 where
@@ -377,7 +443,9 @@ pub struct SyscallFrame {
 
 pub fn init_syscalls(_cpu_id: usize, _stack_top: usize) {}
 pub fn set_kernel_stack_top(_cpu_id: usize, _stack_top: usize) {}
-pub fn get_fs_base() -> u64 { 0 }
+pub fn get_fs_base() -> u64 {
+    0
+}
 pub fn set_fs_base(_val: u64) {}
 
 pub unsafe fn restore_task_context(_next_ctx: *const SavedTaskContext) -> ! {
@@ -389,7 +457,10 @@ pub fn get_initial_segments() -> (usize, usize) {
 }
 
 pub fn get_current_paging_root() -> PhysFrame {
-    PhysFrame { start_address: PhysAddr::new(0), _phantom: PhantomData }
+    PhysFrame {
+        start_address: PhysAddr::new(0),
+        _phantom: PhantomData,
+    }
 }
 
 pub fn complete_interrupt() {}

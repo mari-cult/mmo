@@ -41,9 +41,9 @@ end
 echo "Building the kernel (Limine target)..."
 set -q KERNEL_RUSTFLAGS; or set KERNEL_RUSTFLAGS ""
 if test -n "$KERNEL_RUSTFLAGS"
-    env RUSTFLAGS="$KERNEL_RUSTFLAGS" cargo build -p kernel --target "$TARGET"
+    env RUSTFLAGS="$KERNEL_RUSTFLAGS" cargo build -p kernel --target "$TARGET" || exit 1
 else
-    cargo build -p kernel --target "$TARGET"
+    cargo build -p kernel --target "$TARGET" || exit 1
 end
 
 set -g KERNEL_BIN "target/$TARGET/debug/kernel"
@@ -77,7 +77,7 @@ function build_rootfs_from_dir
     set -l output_img $argv[2]
     set -l host_target (rustc -vV | awk '/host:/ {print $2}')
     set -l size_mib (resolve_rootfs_size_mib "$source_dir")
-    
+
     cargo run --offline --manifest-path tools/mkrootfs/Cargo.toml --target "$host_target" \
         --config 'unstable.build-std=["std","panic_abort"]' -- \
         --source "$source_dir" \
@@ -99,16 +99,19 @@ function rootfs_has_crabfs_superblock
 end
 
 if test -n "$GENTOO_STAGE3_TARBALL"
+    if not test -f "$GENTOO_STAGE3_TARBALL"
+        echo "Error: Gentoo stage3 tarball not found at $GENTOO_STAGE3_TARBALL"
+        exit 1
+    end
     echo "Importing Gentoo stage3 into $ROOTFS_IMG..."
     ./tools/import_rootfs.sh "$GENTOO_STAGE3_TARBALL" "$GENTOO_STAGE3_STAGING" "$ROOTFS_IMG"
 else if test -d "$GENTOO_STAGE3_STAGING"
     echo "Packing existing rootfs tree from $GENTOO_STAGE3_STAGING into $ROOTFS_IMG..."
     build_rootfs_from_dir "$GENTOO_STAGE3_STAGING" "$ROOTFS_IMG"
 else if not rootfs_has_crabfs_superblock "$ROOTFS_IMG"
-    echo "Creating minimal crabfs rootfs image at $ROOTFS_IMG..."
-    rm -rf "$EMPTY_ROOTFS_DIR"
-    mkdir -p "$EMPTY_ROOTFS_DIR"
-    build_rootfs_from_dir "$EMPTY_ROOTFS_DIR" "$ROOTFS_IMG"
+    echo "Error: No rootfs source found and $ROOTFS_IMG is not a valid crabfs image."
+    echo "Please set GENTOO_STAGE3_TARBALL or ensure the staging directory '$GENTOO_STAGE3_STAGING' exists."
+    exit 1
 end
 
 # Create a temporary directory for the FAT-emulated Limine disk.
@@ -146,12 +149,14 @@ set -l qemu_args \
     -drive file=fat:rw:"$EFI_ROOT",format=raw \
     -drive if=none,id=drv0,file="$ROOTFS_IMG",format=raw \
     -device virtio-blk-pci,drive=drv0 \
-    -serial stdio \
+    -serial mon:stdio \
     -display none \
-    -m 256M
+    -m 512M
 
 if test "$ARCH" = "x86_64"; and test (uname) = "Linux"; and test -e /dev/kvm
     set qemu_args $qemu_args -accel kvm
+else
+    set qemu_args $qemu_args -accel tcg,thread=multi
 end
 
 $QEMU_BIN $qemu_args

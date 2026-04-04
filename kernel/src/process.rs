@@ -1,6 +1,6 @@
-use crate::arch::{SavedTaskContext, restore_task_context, without_interrupts};
-use crate::arch::smp::MAX_CPUS;
 use crate::arch::apic;
+use crate::arch::smp::MAX_CPUS;
+use crate::arch::{SavedTaskContext, restore_task_context, without_interrupts};
 use crate::{ktrace, println};
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::vec;

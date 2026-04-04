@@ -1,8 +1,8 @@
 extern crate alloc;
 
+use crate::limine::{EXECUTABLE_CMDLINE_REQUEST_ID, Request};
 use alloc::string::{String, ToString};
 use limine_sys::*;
-use crate::limine::{Request, EXECUTABLE_CMDLINE_REQUEST_ID};
 use spin::Lazy;
 
 #[derive(Debug, Clone, Default)]
@@ -27,7 +27,10 @@ pub fn params() -> &'static KernelParams {
 }
 
 pub fn resolved_init_path() -> String {
-    params().init.clone().unwrap_or_else(|| "/sbin/init".to_string())
+    params()
+        .init
+        .clone()
+        .unwrap_or_else(|| "/sbin/init".to_string())
 }
 
 pub enum RootDevice {
@@ -56,7 +59,9 @@ fn parse_kernel_params() -> KernelParams {
     let raw = EXECUTABLE_CMDLINE_REQUEST
         .response()
         .map(|response| unsafe {
-            core::ffi::CStr::from_ptr(response.cmdline).to_str().unwrap_or("")
+            core::ffi::CStr::from_ptr(response.cmdline)
+                .to_str()
+                .unwrap_or("")
         })
         .unwrap_or("")
         .trim()

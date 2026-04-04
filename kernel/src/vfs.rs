@@ -1,7 +1,7 @@
 extern crate alloc;
 
-use crate::print;
 use crate::arch::serial;
+use crate::print;
 use crate::virtio_blk::VirtioBlkDevice;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};

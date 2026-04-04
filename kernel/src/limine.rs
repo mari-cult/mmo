@@ -23,7 +23,6 @@ impl<T> Request<T> {
 
 unsafe impl<T> Sync for Request<T> {}
 
-
 pub const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
 
 pub const HHDM_REQUEST_ID: [u64; 4] = [
@@ -58,8 +57,12 @@ pub const BASE_REVISION_ID: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start_marker")]
-static REQUESTS_START_MARKER: [u64; 4] =
-    [0xf6b8f4b39de7d1ae, 0xfab91a6940fcb9cf, 0x785c6ed015d3e316, 0x181e920a7852b9d9];
+static REQUESTS_START_MARKER: [u64; 4] = [
+    0xf6b8f4b39de7d1ae,
+    0xfab91a6940fcb9cf,
+    0x785c6ed015d3e316,
+    0x181e920a7852b9d9,
+];
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end_marker")]
@@ -67,7 +70,7 @@ static REQUESTS_END_MARKER: [u64; 2] = [0xadc0e0531bb10d03, 0x9572709f31764c62];
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
-pub static BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 2];
+pub static BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 6];
 
 pub fn base_revision_supported() -> bool {
     BASE_REVISION[2] == 0
@@ -82,4 +85,3 @@ pub const LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE: u32 = 5;
 pub const LIMINE_MEMMAP_EXECUTABLE_AND_MODULES: u32 = 6;
 pub const LIMINE_MEMMAP_FRAMEBUFFER: u32 = 7;
 pub const LIMINE_MEMMAP_RESERVED_MAPPED: u32 = 8;
-

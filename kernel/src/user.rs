@@ -1,10 +1,10 @@
 extern crate alloc;
 
-use crate::vfs;
 use crate::arch::{
     MAX_CPUS, Page, PageSize, PageTable, PageTableFlags, PhysAddr, PhysFrame, SavedTaskContext,
     Size4KiB, SyscallFrame, VirtAddr, gdt, smp,
 };
+use crate::vfs;
 use crate::{allocator, kdebug, ktrace, process};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -317,7 +317,7 @@ fn create_address_space() -> Result<AddressSpace, UserError> {
     unsafe {
         let new_table = &mut *new_ptr;
         let current_table = &*current_ptr;
-        
+
         crate::arch::paging::copy_kernel_mappings(new_table, current_table);
     }
 

@@ -1,10 +1,10 @@
 extern crate alloc;
 
 use crate::allocator::{self, VmError};
+use crate::arch::{Page, PageTableFlags, PhysFrame, Size4KiB, VirtAddr};
 use crate::zram::{self, ZramDevice, ZramError};
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use spin::{Lazy, Mutex};
-use crate::arch::{Page, PageTableFlags, PhysFrame, Size4KiB, VirtAddr};
 
 const RECLAIM_START: usize = 0x_5555_0000_0000;
 const RECLAIM_MAX_PAGES: usize = 256;

@@ -47,7 +47,12 @@ pub fn init(params: &crate::cmdline::KernelParams) {
 
     CONSOLE_LEVEL.store(console_level as u8, Ordering::SeqCst);
     TRACE_ENABLED.store(
-        params.debug || params.loglevel.parse::<u8>().map(|l| l >= 7).unwrap_or(false),
+        params.debug
+            || params
+                .loglevel
+                .parse::<u8>()
+                .map(|l| l >= 7)
+                .unwrap_or(false),
         Ordering::SeqCst,
     );
 }

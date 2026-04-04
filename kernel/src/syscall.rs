@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::arch::{ARCH_NAME, DYNLINK_CONF, DYNLINK_PATH, SyscallFrame, MAX_CPUS};
+use crate::arch::{ARCH_NAME, DYNLINK_CONF, DYNLINK_PATH, MAX_CPUS, SyscallFrame};
 use crate::{kdebug, ktrace, kwarn, process, user, vfs};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -281,8 +281,9 @@ pub fn init() {
 
 pub fn init_for_cpu(cpu_id: usize) {
     let cpu = cpu_id.min(MAX_CPUS.saturating_sub(1));
-    let stack_top =
-        unsafe { core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as *const u8 as usize + SYSCALL_STACK_SIZE };
+    let stack_top = unsafe {
+        core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as *const u8 as usize + SYSCALL_STACK_SIZE
+    };
     crate::arch::init_syscalls(cpu, stack_top);
 }
 
