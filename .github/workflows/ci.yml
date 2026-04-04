@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build and Lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, rust-src
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.arch }}-
+
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build Kernel (${{ matrix.arch }})
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            TARGET="x86_64-unknown-none"
+          else
+            TARGET="aarch64-unknown-none"
+          fi
+          cargo build -p kernel --target $TARGET
+
+      - name: Run Clippy (${{ matrix.arch }})
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            TARGET="x86_64-unknown-none"
+          else
+            TARGET="aarch64-unknown-none"
+          fi
+          cargo clippy -p kernel --target $TARGET -- -D warnings

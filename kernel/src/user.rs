@@ -624,7 +624,7 @@ pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, Use
     let default_argv = [path];
     let argv = if path == "/usr/bin/bash" {
         &bash_argv[..]
-    } else if path == "/usr/lib/ld-musl-x86_64.so.1" || path == "/lib/ld-musl-x86_64.so.1" {
+    } else if path == "/usr/lib/ld-musl-x86_64.so.1" || path == crate::arch::DYNLINK_PATH {
         &ldso_argv[..]
     } else {
         &default_argv[..]
