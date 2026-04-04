@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use crate::smp::MAX_CPUS;
+use crate::arch::smp::MAX_CPUS;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use spin::{Lazy, Mutex};
@@ -99,15 +99,15 @@ fn selectors_for_cpu(cpu_id: usize) -> Selectors {
 }
 
 pub fn user_code_selector() -> SegmentSelector {
-    selectors_for_cpu(crate::smp::current_cpu()).user_code_selector
+    selectors_for_cpu(crate::arch::smp::current_cpu()).user_code_selector
 }
 
 pub fn user_data_selector() -> SegmentSelector {
-    selectors_for_cpu(crate::smp::current_cpu()).user_data_selector
+    selectors_for_cpu(crate::arch::smp::current_cpu()).user_data_selector
 }
 
 pub fn kernel_privilege_stack_top() -> VirtAddr {
-    let cpu_id = crate::smp::current_cpu();
+    let cpu_id = crate::arch::smp::current_cpu();
     let mut gdts = CPU_GDTS.lock();
     if gdts[cpu_id].is_none() {
         gdts[cpu_id] = Some(build_cpu_gdt());

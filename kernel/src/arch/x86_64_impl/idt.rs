@@ -34,7 +34,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     unsafe {
         idt.double_fault
             .set_handler_fn(double_fault_handler)
-            .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
+            .set_stack_index(crate::arch::gdt::DOUBLE_FAULT_IST_INDEX);
     }
     unsafe {
         idt[InterruptIndex::Timer as u8]
@@ -45,7 +45,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     unsafe {
         idt.page_fault
             .set_handler_fn(page_fault_handler)
-            .set_stack_index(crate::gdt::DOUBLE_FAULT_IST_INDEX);
+            .set_stack_index(crate::arch::gdt::DOUBLE_FAULT_IST_INDEX);
     }
     idt
 });
@@ -127,7 +127,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn apic_spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    crate::apic::complete_interrupt();
+    crate::arch::apic::complete_interrupt();
 }
 
 fn handle_fault(

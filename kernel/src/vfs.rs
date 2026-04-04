@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use crate::print;
-use crate::serial;
+use crate::arch::serial;
 use crate::virtio_blk::VirtioBlkDevice;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
@@ -189,7 +189,7 @@ impl Vfs {
     }
 
     fn open(&mut self, path: &str, flags: i32) -> Result<i32, VfsError> {
-        if str_eq_lit(path, "/usr/etc/ld-musl-x86_64.path") {
+        if str_eq_lit(path, crate::arch::DYNLINK_CONF) {
             return Err(VfsError::NotFound);
         }
         if str_eq_lit(path, "/dev/stdin")

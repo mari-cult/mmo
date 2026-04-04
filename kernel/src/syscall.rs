@@ -1,16 +1,10 @@
 extern crate alloc;
 
-use crate::{gdt, kdebug, ktrace, kwarn, process, smp::MAX_CPUS, user, vfs};
+use crate::arch::{ARCH_NAME, DYNLINK_CONF, DYNLINK_PATH, SyscallFrame, MAX_CPUS};
+use crate::{kdebug, ktrace, kwarn, process, user, vfs};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::VirtAddr;
-use x86_64::instructions::segmentation::Segment;
-use x86_64::registers::model_specific::FsBase;
-use x86_64::registers::model_specific::{
-    Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star,
-};
-use x86_64::registers::rflags::RFlags;
 
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
@@ -115,25 +109,10 @@ const SYS_EXIT: usize = 60;
 static UNKNOWN_SYSCALL_SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static SYSCALL_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-#[repr(C)]
-struct SyscallCpuLocal {
-    kernel_rsp: usize,
-    user_rsp: usize,
-    return_rax: usize,
-}
-
 const SYSCALL_STACK_SIZE: usize = 4096 * 16;
 
 #[repr(align(16))]
 struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
-
-static mut SYSCALL_CPU_LOCALS: [SyscallCpuLocal; MAX_CPUS] = [const {
-    SyscallCpuLocal {
-        kernel_rsp: 0,
-        user_rsp: 0,
-        return_rax: 0,
-    }
-}; MAX_CPUS];
 
 static mut SYSCALL_STACKS: [SyscallStack; MAX_CPUS] =
     [const { SyscallStack([0; SYSCALL_STACK_SIZE]) }; MAX_CPUS];
@@ -147,32 +126,6 @@ struct SyscallArgs {
     a3: usize,
     a4: usize,
     a5: usize,
-}
-
-#[repr(C)]
-pub struct SyscallFrame {
-    pub nr: usize,
-    pub a0: usize,
-    pub a1: usize,
-    pub a2: usize,
-    pub a3: usize,
-    pub a4: usize,
-    pub a5: usize,
-    pub user_rsp: usize,
-    pub rcx: usize,
-    pub r11: usize,
-    pub rdi: usize,
-    pub rsi: usize,
-    pub rdx: usize,
-    pub r10: usize,
-    pub r8: usize,
-    pub r9: usize,
-    pub rbp: usize,
-    pub rbx: usize,
-    pub r12: usize,
-    pub r13: usize,
-    pub r14: usize,
-    pub r15: usize,
 }
 
 #[repr(C)]
@@ -327,94 +280,15 @@ pub fn init() {
 }
 
 pub fn init_for_cpu(cpu_id: usize) {
-    let handler_addr = syscall_handler as *const () as usize;
-    unsafe {
-        let cpu = cpu_id.min(MAX_CPUS.saturating_sub(1));
-        let stack_top =
-            core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as *const u8 as usize + SYSCALL_STACK_SIZE;
-        SYSCALL_CPU_LOCALS[cpu].kernel_rsp = stack_top;
-        let cpu_local = VirtAddr::from_ptr(core::ptr::addr_of!(SYSCALL_CPU_LOCALS[cpu]));
-        GsBase::write(cpu_local);
-        KernelGsBase::write(cpu_local);
-    }
-    Star::write(
-        gdt::user_code_selector(),
-        gdt::user_data_selector(),
-        x86_64::instructions::segmentation::CS::get_reg(),
-        x86_64::instructions::segmentation::SS::get_reg(),
-    )
-    .expect("invalid syscall STAR selectors");
-    LStar::write(VirtAddr::new(handler_addr as u64));
-    SFMask::write(
-        RFlags::INTERRUPT_FLAG
-            | RFlags::TRAP_FLAG
-            | RFlags::DIRECTION_FLAG
-            | RFlags::ALIGNMENT_CHECK
-            | RFlags::NESTED_TASK,
-    );
-    unsafe {
-        Efer::update(|efer| efer.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
-    }
+    let cpu = cpu_id.min(MAX_CPUS.saturating_sub(1));
+    let stack_top =
+        unsafe { core::ptr::addr_of!(SYSCALL_STACKS[cpu]) as *const u8 as usize + SYSCALL_STACK_SIZE };
+    crate::arch::init_syscalls(cpu, stack_top);
 }
 
 pub fn set_kernel_stack_top(stack_top: usize) {
-    unsafe {
-        let cpu = crate::smp::current_cpu().min(MAX_CPUS.saturating_sub(1));
-        SYSCALL_CPU_LOCALS[cpu].kernel_rsp = stack_top;
-    }
-}
-
-#[unsafe(naked)]
-pub unsafe extern "C" fn syscall_handler() -> ! {
-    core::arch::naked_asm!(
-        "mov %rsp, %gs:8",
-        "mov %gs:0, %rsp",
-        "sub $176, %rsp",
-        "mov %rax, 0(%rsp)",
-        "mov %rdi, 8(%rsp)",
-        "mov %rsi, 16(%rsp)",
-        "mov %rdx, 24(%rsp)",
-        "mov %r10, 32(%rsp)",
-        "mov %r8, 40(%rsp)",
-        "mov %r9, 48(%rsp)",
-        "mov %gs:8, %rax",
-        "mov %rax, 56(%rsp)",
-        "mov %rcx, 64(%rsp)",
-        "mov %r11, 72(%rsp)",
-        "mov %rdi, 80(%rsp)",
-        "mov %rsi, 88(%rsp)",
-        "mov %rdx, 96(%rsp)",
-        "mov %r10, 104(%rsp)",
-        "mov %r8, 112(%rsp)",
-        "mov %r9, 120(%rsp)",
-        "mov %rbp, 128(%rsp)",
-        "mov %rbx, 136(%rsp)",
-        "mov %r12, 144(%rsp)",
-        "mov %r13, 152(%rsp)",
-        "mov %r14, 160(%rsp)",
-        "mov %r15, 168(%rsp)",
-        "mov %rsp, %rdi",
-        "call syscall_dispatch",
-        "mov %rax, %gs:16",
-        "mov 168(%rsp), %r15",
-        "mov 160(%rsp), %r14",
-        "mov 152(%rsp), %r13",
-        "mov 144(%rsp), %r12",
-        "mov 136(%rsp), %rbx",
-        "mov 128(%rsp), %rbp",
-        "mov 120(%rsp), %r9",
-        "mov 112(%rsp), %r8",
-        "mov 104(%rsp), %r10",
-        "mov 96(%rsp), %rdx",
-        "mov 88(%rsp), %rsi",
-        "mov 80(%rsp), %rdi",
-        "mov 72(%rsp), %r11",
-        "mov 64(%rsp), %rcx",
-        "mov 56(%rsp), %rsp",
-        "mov %gs:16, %rax",
-        "sysretq",
-        options(att_syntax)
-    )
+    let cpu = crate::arch::smp::current_cpu().min(MAX_CPUS.saturating_sub(1));
+    crate::arch::set_kernel_stack_top(cpu, stack_top);
 }
 
 fn read_cstr(ptr: *const u8, max_len: usize) -> Result<String, i32> {
@@ -448,7 +322,7 @@ fn read_cstr_array(ptr: *const *const u8, max_count: usize) -> Result<Vec<String
     Err(E2BIG)
 }
 
-fn apply_saved_context(frame: &mut SyscallFrame, ctx: &process::SavedTaskContext) {
+fn apply_saved_context(frame: &mut SyscallFrame, ctx: &crate::arch::SavedTaskContext) {
     frame.r15 = ctx.r15;
     frame.r14 = ctx.r14;
     frame.r13 = ctx.r13;
@@ -462,8 +336,8 @@ fn apply_saved_context(frame: &mut SyscallFrame, ctx: &process::SavedTaskContext
     frame.rsi = ctx.rsi;
     frame.rdx = ctx.rdx;
     frame.rcx = ctx.rip;
-    frame.rbx = ctx.rbx;
     frame.user_rsp = ctx.rsp;
+    frame.nr = ctx.rax;
 }
 
 fn cstr_eq(ptr: *const u8, lit: &str) -> Result<bool, i32> {
@@ -497,7 +371,7 @@ fn write_uts(dst: *mut LinuxUtsname) -> usize {
     copy_field(&mut out.nodename, b"qemu");
     copy_field(&mut out.release, b"6.7");
     copy_field(&mut out.version, b"#67");
-    copy_field(&mut out.machine, b"x86_64");
+    copy_field(&mut out.machine, ARCH_NAME.as_bytes());
     copy_field(&mut out.domainname, b"local");
     unsafe {
         dst.write_volatile(out);
@@ -645,7 +519,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             frame.rcx,
             frame.user_rsp,
             frame.r11,
-            FsBase::read().as_u64(),
+            crate::arch::get_fs_base(),
             frame.rdi,
             frame.rsi,
             frame.rdx,
@@ -1129,10 +1003,10 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                         return neg_errno(EFAULT);
                     }
                     let tio = LinuxTermios {
-                        c_iflag: crate::serial::tty_iflag(),
-                        c_oflag: crate::serial::tty_oflag(),
-                        c_cflag: crate::serial::tty_cflag(),
-                        c_lflag: crate::serial::tty_lflag(),
+                        c_iflag: crate::arch::serial::tty_iflag(),
+                        c_oflag: crate::arch::serial::tty_oflag(),
+                        c_cflag: crate::arch::serial::tty_cflag(),
+                        c_lflag: crate::arch::serial::tty_lflag(),
                         c_line: 0,
                         c_cc: [0; 19],
                     };
@@ -1144,7 +1018,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
                         return neg_errno(EFAULT);
                     }
                     let tio = unsafe { (argp as *const LinuxTermios).read_volatile() };
-                    crate::serial::set_tty_termios(
+                    crate::arch::serial::set_tty_termios(
                         tio.c_iflag,
                         tio.c_oflag,
                         tio.c_cflag,
@@ -1321,7 +1195,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             process::on_task_exit()
         }
         SYS_OPEN => {
-            if let Ok(true) = cstr_eq(a0 as *const u8, "/usr/etc/ld-musl-x86_64.path") {
+            if let Ok(true) = cstr_eq(a0 as *const u8, DYNLINK_CONF) {
                 return neg_errno(ENOENT);
             }
             let path = match read_cstr(a0 as *const u8, 4096) {
@@ -1344,7 +1218,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             }
         }
         SYS_OPENAT => {
-            if let Ok(true) = cstr_eq(a1 as *const u8, "/usr/etc/ld-musl-x86_64.path") {
+            if let Ok(true) = cstr_eq(a1 as *const u8, DYNLINK_CONF) {
                 return neg_errno(ENOENT);
             }
             let path = match read_cstr(a1 as *const u8, 4096) {

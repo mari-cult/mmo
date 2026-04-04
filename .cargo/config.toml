@@ -9,5 +9,13 @@ rustflags = [
     "-C",
     "relocation-model=static",
     "-C",
-    "link-arg=-Tkernel/linker.ld",
+    "link-arg=-Tkernel/src/linker.ld",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C",
+    "relocation-model=static",
+    "-C",
+    "link-arg=-Tkernel/src/linker.ld",
 ]

@@ -1,7 +1,11 @@
 extern crate alloc;
 
 use crate::vfs;
-use crate::{allocator, gdt, kdebug, ktrace, process, smp::MAX_CPUS, syscall::SyscallFrame};
+use crate::arch::{
+    MAX_CPUS, Page, PageSize, PageTable, PageTableFlags, PhysAddr, PhysFrame, SavedTaskContext,
+    Size4KiB, SyscallFrame, VirtAddr, gdt, smp,
+};
+use crate::{allocator, kdebug, ktrace, process};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -9,10 +13,6 @@ use goblin::elf::Elf;
 use goblin::elf::dynamic::{DT_NEEDED, DT_NULL, DT_STRTAB, Dyn};
 use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
 use spin::{Lazy, Mutex};
-use x86_64::VirtAddr;
-use x86_64::registers::control::Cr3;
-use x86_64::registers::model_specific::FsBase;
-use x86_64::structures::paging::{Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 const PAGE_SIZE: u64 = Size4KiB::SIZE;
 const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
@@ -83,7 +83,7 @@ struct AddressSpace {
 impl Default for AddressSpace {
     fn default() -> Self {
         Self {
-            root_frame: PhysFrame::containing_address(x86_64::PhysAddr::new(0)),
+            root_frame: PhysFrame::containing_address(PhysAddr::new(0)),
             brk: USER_BRK_BASE,
             next_mmap_base: USER_MMAP_BASE,
             mappings: BTreeMap::new(),
@@ -168,7 +168,7 @@ fn current_task_id() -> Option<usize> {
 }
 
 fn current_cpu() -> usize {
-    crate::smp::current_cpu().min(MAX_CPUS.saturating_sub(1))
+    crate::arch::smp::current_cpu().min(MAX_CPUS.saturating_sub(1))
 }
 
 fn current_slot() -> &'static Mutex<UserProcess> {
@@ -239,10 +239,10 @@ fn switch_active_process(pid: Option<u32>) {
                 err
             );
         }
-        FsBase::write(VirtAddr::new(new_proc.fs_base));
+        crate::arch::set_fs_base(new_proc.fs_base);
         *current_slot().lock() = new_proc;
     } else {
-        FsBase::write(VirtAddr::new(0));
+        crate::arch::set_fs_base(0);
     }
     REGISTRY.lock().active_pids[cpu] = pid.unwrap_or(0);
 }
@@ -311,28 +311,14 @@ fn create_address_space() -> Result<AddressSpace, UserError> {
 
     let offset = allocator::physical_memory_offset().map_err(|_| UserError::Vm)?;
     let new_ptr = (offset.as_u64() + root_frame.start_address().as_u64()) as *mut PageTable;
-    let (current_root, _) = Cr3::read();
+    let current_root = crate::arch::get_current_paging_root();
     let current_ptr = (offset.as_u64() + current_root.start_address().as_u64()) as *const PageTable;
 
     unsafe {
         let new_table = &mut *new_ptr;
         let current_table = &*current_ptr;
-        let mut current_rsp = 0usize;
-        core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags, nostack));
-
-        for idx in 256..512 {
-            new_table[idx] = current_table[idx].clone();
-        }
-
-        for virt in [
-            allocator::HEAP_START as u64,
-            KERNEL_VIRTIO_DMA_BASE,
-            current_rsp as u64,
-            create_address_space as *const () as usize as u64,
-        ] {
-            let idx = ((virt >> 39) & 0x1ff) as usize;
-            new_table[idx] = current_table[idx].clone();
-        }
+        
+        crate::arch::paging::copy_kernel_mappings(new_table, current_table);
     }
 
     Ok(AddressSpace {
@@ -352,9 +338,8 @@ fn switch_address_space(asid: u32) -> Result<(), UserError> {
             .map(|space| space.root_frame)
             .ok_or(UserError::Vm)?
     };
-    let (_, flags) = Cr3::read();
     unsafe {
-        Cr3::write(root_frame, flags);
+        crate::arch::paging::switch_to(root_frame);
     }
     Ok(())
 }
@@ -624,7 +609,7 @@ pub fn nanosleep(_ns: u64) {}
 pub fn arch_prctl(code: usize, addr: u64) -> Result<u64, UserError> {
     match code {
         ARCH_SET_FS => {
-            FsBase::write(VirtAddr::new(addr));
+            crate::arch::set_fs_base(addr);
             current_slot().lock().fs_base = addr;
             Ok(0)
         }
@@ -681,7 +666,7 @@ pub fn execve(
     path: &str,
     argv: &[&str],
     envp: &[&str],
-) -> Result<process::SavedTaskContext, UserError> {
+) -> Result<crate::arch::SavedTaskContext, UserError> {
     let pid = current_pid_internal();
     let task_id = current_task_id().ok_or(UserError::Unsupported)?;
     let (old_asid, old_init_path) = {
@@ -765,7 +750,7 @@ pub fn fork_from_syscall(frame: &SyscallFrame) -> Result<u32, UserError> {
 
     REGISTRY.lock().by_pid.insert(child_pid, child);
 
-    let ctx = process::SavedTaskContext {
+    let ctx = crate::arch::SavedTaskContext {
         r15: frame.r15,
         r14: frame.r14,
         r13: frame.r13,
@@ -786,6 +771,7 @@ pub fn fork_from_syscall(frame: &SyscallFrame) -> Result<u32, UserError> {
         rflags: frame.r11,
         rsp: frame.user_rsp,
         ss: usize::from(gdt::user_data_selector().0),
+        ..crate::arch::SavedTaskContext::default()
     };
     kdebug!(
         "USER: fork parent_pid={} child_pid={} child_task={} rip={:#x} rsp={:#x} rax={:#x}",
@@ -817,9 +803,9 @@ pub fn wait4(pid: i32, status_ptr: *mut i32) -> Result<u32, UserError> {
             }
             return Ok(child_pid);
         }
-        x86_64::instructions::interrupts::enable();
-        unsafe { core::arch::asm!("hlt") };
-        x86_64::instructions::interrupts::disable();
+        crate::arch::enable_interrupts();
+        crate::arch::halt();
+        crate::arch::disable_interrupts();
     }
 }
 
@@ -1052,7 +1038,7 @@ fn load_exec_context(
     path: &str,
     argv: &[&str],
     envp: &[&str],
-) -> Result<process::SavedTaskContext, UserError> {
+) -> Result<crate::arch::SavedTaskContext, UserError> {
     let bytes = vfs::read_all(path).map_err(|_| UserError::Vfs)?;
     let elf = validate_elf(&bytes)?;
 
@@ -1118,7 +1104,7 @@ fn load_exec_context(
         space.next_mmap_base = USER_MMAP_BASE.max(space.brk.saturating_add(PAGE_SIZE));
     });
 
-    Ok(process::SavedTaskContext {
+    Ok(crate::arch::SavedTaskContext {
         rip: entry as usize,
         cs: usize::from(gdt::user_code_selector().0),
         rflags: 0x202,
@@ -1127,7 +1113,7 @@ fn load_exec_context(
         rdi: 0,
         rsi: 0,
         rdx: 0,
-        ..process::SavedTaskContext::default()
+        ..crate::arch::SavedTaskContext::default()
     })
 }
 

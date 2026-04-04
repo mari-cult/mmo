@@ -27,3 +27,34 @@ pub unsafe fn init_for_frame(
 
     unsafe { OffsetPageTable::new(&mut *page_table_ptr, physical_memory_offset) }
 }
+
+pub unsafe fn copy_kernel_mappings(new_table: &mut PageTable, current_table: &PageTable) {
+    let mut current_rsp = 0usize;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, preserves_flags, nostack));
+    }
+
+    for idx in 256..512 {
+        new_table[idx] = current_table[idx].clone();
+    }
+
+    // Special case for some bootstrap regions if they are in the lower half
+    // but needed for the transition.
+    for virt in [
+        crate::allocator::HEAP_START as u64,
+        0x0000_6666_0000_0000, // KERNEL_VIRTIO_DMA_BASE
+        current_rsp as u64,
+    ] {
+        let idx = ((virt >> 39) & 0x1ff) as usize;
+        if idx < 256 {
+            new_table[idx] = current_table[idx].clone();
+        }
+    }
+}
+
+pub unsafe fn switch_to(root_frame: PhysFrame) {
+    let (_, flags) = Cr3::read();
+    unsafe {
+        Cr3::write(root_frame, flags);
+    }
+}

@@ -35,7 +35,7 @@ static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init(params: &crate::cmdline::KernelParams) {
-    let console_level = if let Some(level) = params.loglevel {
+    let console_level = if let Ok(level) = params.loglevel.parse::<u8>() {
         Level::from_linux_console_level(level)
     } else if params.quiet {
         Level::Warn
@@ -47,7 +47,7 @@ pub fn init(params: &crate::cmdline::KernelParams) {
 
     CONSOLE_LEVEL.store(console_level as u8, Ordering::SeqCst);
     TRACE_ENABLED.store(
-        params.debug || params.loglevel.is_some_and(|level| level >= 7),
+        params.debug || params.loglevel.parse::<u8>().map(|l| l >= 7).unwrap_or(false),
         Ordering::SeqCst,
     );
 }

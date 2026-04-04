@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib/loader", "lib/crabfs", "kernel"]
+members = ["lib/loader", "lib/crabfs", "lib/limine-sys", "kernel"]
 resolver = "3"
 
 [workspace.package]
@@ -10,10 +10,11 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 loader = { path = "lib/loader" }
 crabfs = { path = "lib/crabfs" }
+limine-sys = { path = "lib/limine-sys" }
 
 x86_64 = "0.15.4"
-limine = "0.5.0"
-uefi = { version = "0.31.0", features = ["alloc", "logger"] }
+limine = { version = "0.6.3" }
+uefi = { version = "0.37.0", features = ["alloc", "logger"] }
 thiserror = { version = "2.0.18", default-features = false }
 reqwest = { version = "0.13.2", default-features = false, features = [
     "rustls-no-provider",
@@ -30,19 +31,19 @@ linked_list_allocator = "0.10.5"
 spin = "0.10.0"
 plist = "1.8.0"
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
-tokio = { version = "1.50.0", default-features = false }
+tokio = { version = "1.51.0", default-features = false }
 clap = { version = "4.6.0", features = [
     "derive",
     "std",
 ], default-features = false }
 aes = "0.8.4"
-hmac = "0.12.1"
+hmac = "0.13.0"
 pbkdf2 = "0.12.2"
 cipher = { version = "0.5.1", features = ["block-padding"] }
 indicatif = "0.18.4"
 byteorder = "1.5"
 bitflags = { version = "2.11.0", default-features = false }
-libc = { version = "0.2.183", default-features = false }
+libc = { version = "0.2.184", default-features = false }
 xattr = "1.6.1"
 rustix = { version = "1.1.4", default-features = false, features = [
     "fs",

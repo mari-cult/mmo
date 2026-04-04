@@ -81,7 +81,7 @@ static TTY_LFLAG: AtomicU32 = AtomicU32::new(DEFAULT_TTY_LFLAG);
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!($($arg)*));
+        $crate::arch::serial::_print(format_args!($($arg)*));
     };
 }
 

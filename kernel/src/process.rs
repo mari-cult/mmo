@@ -1,21 +1,16 @@
-use crate::smp::MAX_CPUS;
-use crate::{apic, ktrace, println};
+use crate::arch::{SavedTaskContext, restore_task_context, without_interrupts};
+use crate::arch::smp::MAX_CPUS;
+use crate::arch::apic;
+use crate::{ktrace, println};
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 use core::array;
 use core::cmp::min;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::{Lazy, Mutex};
-use x86_64::instructions::segmentation::{CS, SS, Segment};
-
-global_asm!(include_str!("switch.s"), options(att_syntax));
-
-unsafe extern "sysv64" {
-    fn restore_task_context(next_ctx: *const SavedTaskContext) -> !;
-}
 
 unsafe extern "C" {
     fn timer_interrupt_entry();
@@ -39,31 +34,6 @@ pub struct AlignedStack([u8; SCHEDULER_STACK_SIZE]);
 
 #[unsafe(no_mangle)]
 pub static mut SCHEDULER_STACK: AlignedStack = AlignedStack([0; SCHEDULER_STACK_SIZE]);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SavedTaskContext {
-    pub r15: usize,
-    pub r14: usize,
-    pub r13: usize,
-    pub r12: usize,
-    pub r11: usize,
-    pub r10: usize,
-    pub r9: usize,
-    pub r8: usize,
-    pub rbp: usize,
-    pub rdi: usize,
-    pub rsi: usize,
-    pub rdx: usize,
-    pub rcx: usize,
-    pub rbx: usize,
-    pub rax: usize,
-    pub rip: usize,
-    pub cs: usize,
-    pub rflags: usize,
-    pub rsp: usize,
-    pub ss: usize,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -191,8 +161,7 @@ impl Task {
         // UEFI target uses the Microsoft x64 ABI, including 32 bytes of shadow space.
         let call_like_rsp = stack_top - 40;
         let context_rsp = call_like_rsp - size_of::<SavedTaskContext>();
-        let cs = usize::from(CS::get_reg().0);
-        let ss = usize::from(SS::get_reg().0);
+        let (cs, ss) = crate::arch::get_initial_segments();
 
         unsafe {
             (call_like_rsp as *mut usize).write(task_return_trampoline as *const () as usize);
@@ -296,7 +265,7 @@ pub struct Scheduler {
 static CURRENT_TASK_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 fn current_cpu_id() -> CpuId {
-    CpuId(crate::smp::current_cpu().min(MAX_CPUS.saturating_sub(1)))
+    CpuId(crate::arch::smp::current_cpu().min(MAX_CPUS.saturating_sub(1)))
 }
 
 impl Scheduler {
@@ -739,18 +708,18 @@ const fn align_down(value: usize, align: usize) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn scheduler_timer_tick(
+pub extern "C" fn scheduler_timer_tick(
     current_ctx: *mut SavedTaskContext,
-) -> *const SavedTaskContext {
+) -> *mut SavedTaskContext {
     if current_ctx.is_null() {
-        apic::complete_interrupt();
-        return core::ptr::null();
+        crate::arch::complete_interrupt();
+        return core::ptr::null_mut();
     }
 
     let cs = unsafe { (*current_ctx).cs };
     let cpl = cs & 0x3;
     if cpl == 0x3 {
-        apic::complete_interrupt();
+        crate::arch::complete_interrupt();
         return current_ctx;
     }
 
@@ -759,8 +728,8 @@ pub extern "sysv64" fn scheduler_timer_tick(
         scheduler.on_timer_tick(current_cpu_id(), current_ctx as usize)
     };
 
-    apic::complete_interrupt();
-    next_ctx as *const SavedTaskContext
+    crate::arch::complete_interrupt();
+    next_ctx as *mut SavedTaskContext
 }
 
 #[unsafe(no_mangle)]
@@ -780,7 +749,7 @@ pub fn start() -> ! {
 }
 
 pub fn configure_topology(cpu_count: usize) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         SCHEDULER.lock().configure_topology(cpu_count);
     });
 }
@@ -790,19 +759,19 @@ pub fn timer_handler_addr() -> usize {
 }
 
 pub fn yield_current() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         SCHEDULER.lock().request_yield(current_cpu_id());
     });
 }
 
 pub fn block_current() {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         SCHEDULER.lock().block_current(current_cpu_id());
     });
 }
 
 pub fn wake_task(task_id: usize) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         SCHEDULER.lock().wake_task(task_id);
     });
 }
@@ -816,11 +785,11 @@ pub fn current_task_id() -> Option<usize> {
 }
 
 pub fn allocate_task_id() -> usize {
-    x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().allocate_task_id())
+    without_interrupts(|| SCHEDULER.lock().allocate_task_id())
 }
 
 pub fn on_task_exit() -> ! {
-    x86_64::instructions::interrupts::disable();
+    crate::arch::disable_interrupts();
 
     let next_ctx = {
         let mut scheduler = SCHEDULER.lock();
@@ -831,11 +800,7 @@ pub fn on_task_exit() -> ! {
         unsafe { restore_task_context(next_ctx as *const SavedTaskContext) }
     }
 
-    loop {
-        unsafe {
-            asm!("sti; hlt; cli");
-        }
-    }
+    crate::arch::halt();
 }
 
 pub static SCHEDULER: Lazy<Mutex<Scheduler>> = Lazy::new(|| Mutex::new(Scheduler::new()));
