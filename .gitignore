@@ -8,3 +8,5 @@ target/
 /iso_root
 *.tar.*
 /stage3-root
+*.exe
+*.obj

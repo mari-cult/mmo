@@ -1,8 +1,6 @@
 # To Do
 
-## Syscalls
-
-- [x] fork
-- [x] pipe
-- [ ] readlink
-
+- [ ] PE Import/DLL loading
+- [ ] Relocation handling
+- [ ] NtCreateUserProcess 
+- [ ] SEC_IMage section mapping

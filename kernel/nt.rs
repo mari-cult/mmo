@@ -1,0 +1,574 @@
+extern crate alloc;
+
+use crate::vfs;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use spin::{Lazy, Mutex};
+
+pub type NtStatus = i32;
+pub type Handle = usize;
+pub type AccessMask = u32;
+
+pub const STATUS_SUCCESS: NtStatus = 0;
+pub const STATUS_NOT_IMPLEMENTED: NtStatus = 0xC000_0002u32 as i32;
+pub const STATUS_INVALID_HANDLE: NtStatus = 0xC000_0008u32 as i32;
+pub const STATUS_INVALID_PARAMETER: NtStatus = 0xC000_000Du32 as i32;
+pub const STATUS_NO_MEMORY: NtStatus = 0xC000_0017u32 as i32;
+pub const STATUS_CONFLICTING_ADDRESSES: NtStatus = 0xC000_0018u32 as i32;
+pub const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022u32 as i32;
+pub const STATUS_OBJECT_TYPE_MISMATCH: NtStatus = 0xC000_0024u32 as i32;
+pub const STATUS_OBJECT_NAME_NOT_FOUND: NtStatus = 0xC000_0034u32 as i32;
+pub const STATUS_OBJECT_PATH_NOT_FOUND: NtStatus = 0xC000_003Au32 as i32;
+pub const STATUS_OBJECT_NAME_COLLISION: NtStatus = 0xC000_0035u32 as i32;
+pub const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004u32 as i32;
+pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023u32 as i32;
+pub const STATUS_END_OF_FILE: NtStatus = 0xC000_0011u32 as i32;
+pub const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001u32 as i32;
+pub const STATUS_IMAGE_MACHINE_TYPE_MISMATCH: NtStatus = 0x4000_002Eu32 as i32;
+pub const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007Bu32 as i32;
+pub const STATUS_NOT_SUPPORTED: NtStatus = 0xC000_00BBu32 as i32;
+
+pub const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+pub const SYNCHRONIZE: AccessMask = 0x0010_0000;
+pub const EVENT_QUERY_STATE: AccessMask = 0x0001;
+pub const EVENT_MODIFY_STATE: AccessMask = 0x0002;
+pub const FILE_READ_DATA: AccessMask = 0x0001;
+pub const FILE_WRITE_DATA: AccessMask = 0x0002;
+pub const FILE_GENERIC_READ: AccessMask = 0x0012_0089;
+pub const FILE_GENERIC_WRITE: AccessMask = 0x0012_0116;
+pub const SECTION_MAP_READ: AccessMask = 0x0004;
+pub const SECTION_MAP_WRITE: AccessMask = 0x0002;
+pub const SECTION_MAP_EXECUTE: AccessMask = 0x0008;
+pub const SECTION_ALL_ACCESS: AccessMask = 0x000F_001F;
+pub const PROCESS_ALL_ACCESS: AccessMask = 0x001F_FFFF;
+pub const THREAD_ALL_ACCESS: AccessMask = 0x001F_FFFF;
+
+pub const SEC_IMAGE: u32 = 0x0100_0000;
+pub const SEC_COMMIT: u32 = 0x0800_0000;
+
+pub const PAGE_NOACCESS: u32 = 0x01;
+pub const PAGE_READONLY: u32 = 0x02;
+pub const PAGE_READWRITE: u32 = 0x04;
+pub const PAGE_EXECUTE: u32 = 0x10;
+pub const PAGE_EXECUTE_READ: u32 = 0x20;
+pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+pub const MEM_COMMIT: u32 = 0x1000;
+pub const MEM_RESERVE: u32 = 0x2000;
+pub const MEM_RELEASE: u32 = 0x8000;
+
+pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
+pub const FILE_OPEN: u32 = 0x0000_0001;
+pub const FILE_CREATE: u32 = 0x0000_0002;
+pub const FILE_OPEN_IF: u32 = 0x0000_0003;
+pub const FILE_OVERWRITE: u32 = 0x0000_0004;
+pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
+
+pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+pub const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+pub const FILE_STANDARD_INFORMATION_CLASS: u32 = 5;
+pub const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
+pub const FILE_NAME_INFORMATION_CLASS: u32 = 9;
+
+pub const EVENT_TYPE_NOTIFICATION: u32 = 0;
+pub const EVENT_TYPE_SYNCHRONIZATION: u32 = 1;
+
+pub const SECTION_INHERIT_VIEW_SHARE: u32 = 1;
+pub const SECTION_INHERIT_VIEW_UNMAP: u32 = 2;
+
+pub const SYSCALL_NT_CLOSE: usize = 0;
+pub const SYSCALL_NT_QUERY_INFORMATION_PROCESS: usize = 1;
+pub const SYSCALL_NT_QUERY_INFORMATION_FILE: usize = 2;
+pub const SYSCALL_NT_READ_FILE: usize = 3;
+pub const SYSCALL_NT_WRITE_FILE: usize = 4;
+pub const SYSCALL_NT_CREATE_FILE: usize = 5;
+pub const SYSCALL_NT_OPEN_FILE: usize = 6;
+pub const SYSCALL_NT_CREATE_SECTION: usize = 7;
+pub const SYSCALL_NT_MAP_VIEW_OF_SECTION: usize = 8;
+pub const SYSCALL_NT_UNMAP_VIEW_OF_SECTION: usize = 9;
+pub const SYSCALL_NT_ALLOCATE_VIRTUAL_MEMORY: usize = 10;
+pub const SYSCALL_NT_FREE_VIRTUAL_MEMORY: usize = 11;
+pub const SYSCALL_NT_PROTECT_VIRTUAL_MEMORY: usize = 12;
+pub const SYSCALL_NT_CREATE_EVENT: usize = 13;
+pub const SYSCALL_NT_SET_EVENT: usize = 14;
+pub const SYSCALL_NT_WAIT_FOR_SINGLE_OBJECT: usize = 15;
+pub const SYSCALL_NT_CREATE_USER_PROCESS: usize = 16;
+pub const SYSCALL_NT_TERMINATE_PROCESS: usize = 17;
+pub const SYSCALL_NT_TERMINATE_THREAD: usize = 18;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct UnicodeString {
+    pub length: u16,
+    pub maximum_length: u16,
+    pub buffer: *const u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ObjectAttributes {
+    pub length: u32,
+    pub root_directory: Handle,
+    pub object_name: *const UnicodeString,
+    pub attributes: u32,
+    pub security_descriptor: *const u8,
+    pub security_quality_of_service: *const u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IoStatusBlock {
+    pub status: NtStatus,
+    pub information: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ClientId {
+    pub unique_process: usize,
+    pub unique_thread: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ProcessBasicInformation {
+    pub reserved1: usize,
+    pub peb_base_address: usize,
+    pub reserved2: [usize; 2],
+    pub unique_process_id: usize,
+    pub inherited_from_unique_process_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FileStandardInformation {
+    pub allocation_size: i64,
+    pub end_of_file: i64,
+    pub number_of_links: u32,
+    pub delete_pending: u8,
+    pub directory: u8,
+    pub reserved: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FilePositionInformation {
+    pub current_byte_offset: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RtlUserProcessParameters {
+    pub length: u32,
+    pub maximum_length: u32,
+    pub flags: u32,
+    pub debug_flags: u32,
+    pub console_handle: usize,
+    pub standard_input: Handle,
+    pub standard_output: Handle,
+    pub standard_error: Handle,
+    pub image_path_name: UnicodeString,
+    pub command_line: UnicodeString,
+}
+
+impl Default for RtlUserProcessParameters {
+    fn default() -> Self {
+        Self {
+            length: core::mem::size_of::<Self>() as u32,
+            maximum_length: core::mem::size_of::<Self>() as u32,
+            flags: 0,
+            debug_flags: 0,
+            console_handle: 0,
+            standard_input: 0,
+            standard_output: 0,
+            standard_error: 0,
+            image_path_name: UnicodeString::default(),
+            command_line: UnicodeString::default(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Peb {
+    pub inherited_address_space: u8,
+    pub read_image_file_exec_options: u8,
+    pub being_debugged: u8,
+    pub spare: u8,
+    pub mutant: usize,
+    pub image_base_address: usize,
+    pub ldr: usize,
+    pub process_parameters: *mut RtlUserProcessParameters,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Teb {
+    pub reserved1: [usize; 12],
+    pub process_environment_block: *mut Peb,
+    pub client_id: ClientId,
+    pub reserved2: [usize; 20],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectType {
+    Directory,
+    SymbolicLink,
+    File,
+    Section,
+    Process,
+    Thread,
+    Event,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileObject {
+    pub path: String,
+    pub vfs_handle: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EventObject {
+    pub signaled: bool,
+    pub manual_reset: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SectionObject {
+    pub path: Option<String>,
+    pub protection: u32,
+    pub attributes: u32,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessObject {
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadObject {
+    pub tid: usize,
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjectData {
+    Directory,
+    SymbolicLink { target: String },
+    File(FileObject),
+    Section(SectionObject),
+    Process(ProcessObject),
+    Thread(ThreadObject),
+    Event(EventObject),
+}
+
+#[derive(Debug, Clone)]
+struct ObjectRecord {
+    object_type: ObjectType,
+    name: Option<String>,
+    refs: usize,
+    data: ObjectData,
+}
+
+#[derive(Default)]
+struct ObjectManager {
+    next_id: u32,
+    objects: BTreeMap<u32, ObjectRecord>,
+    named: BTreeMap<String, u32>,
+}
+
+static OBJECTS: Lazy<Mutex<ObjectManager>> = Lazy::new(|| {
+    Mutex::new(ObjectManager {
+        next_id: 1,
+        ..ObjectManager::default()
+    })
+});
+
+pub fn init_namespace() {
+    let mut objects = OBJECTS.lock();
+    if !objects.named.is_empty() {
+        return;
+    }
+
+    let _ = create_named(&mut objects, "\\", ObjectData::Directory);
+    let _ = create_named(&mut objects, "\\Device", ObjectData::Directory);
+    let _ = create_named(&mut objects, "\\??", ObjectData::Directory);
+    let _ = create_named(&mut objects, "\\KnownDlls", ObjectData::Directory);
+    let _ = create_named(
+        &mut objects,
+        "\\Device\\Crabfs0",
+        ObjectData::Directory,
+    );
+    let _ = create_named(
+        &mut objects,
+        "\\??\\C:",
+        ObjectData::SymbolicLink {
+            target: "\\Device\\Crabfs0".to_string(),
+        },
+    );
+    let _ = create_named(
+        &mut objects,
+        "\\SystemRoot",
+        ObjectData::SymbolicLink {
+            target: "\\??\\C:\\Windows".to_string(),
+        },
+    );
+}
+
+fn create_named(objects: &mut ObjectManager, name: &str, data: ObjectData) -> Result<u32, NtStatus> {
+    let canonical = canonicalize_nt_path(name);
+    if objects.named.contains_key(&canonical) {
+        return Err(STATUS_OBJECT_NAME_COLLISION);
+    }
+    let id = objects.next_id;
+    objects.next_id = id.saturating_add(1);
+    let object_type = object_type_of(&data);
+    objects.objects.insert(
+        id,
+        ObjectRecord {
+            object_type,
+            name: Some(canonical.clone()),
+            refs: 1,
+            data,
+        },
+    );
+    objects.named.insert(canonical, id);
+    Ok(id)
+}
+
+fn insert_unnamed(objects: &mut ObjectManager, data: ObjectData) -> u32 {
+    let id = objects.next_id;
+    objects.next_id = id.saturating_add(1);
+    objects.objects.insert(
+        id,
+        ObjectRecord {
+            object_type: object_type_of(&data),
+            name: None,
+            refs: 1,
+            data,
+        },
+    );
+    id
+}
+
+fn object_type_of(data: &ObjectData) -> ObjectType {
+    match data {
+        ObjectData::Directory => ObjectType::Directory,
+        ObjectData::SymbolicLink { .. } => ObjectType::SymbolicLink,
+        ObjectData::File(_) => ObjectType::File,
+        ObjectData::Section(_) => ObjectType::Section,
+        ObjectData::Process(_) => ObjectType::Process,
+        ObjectData::Thread(_) => ObjectType::Thread,
+        ObjectData::Event(_) => ObjectType::Event,
+    }
+}
+
+pub fn create_file(path: String, vfs_handle: i32) -> u32 {
+    let mut objects = OBJECTS.lock();
+    insert_unnamed(&mut objects, ObjectData::File(FileObject { path, vfs_handle }))
+}
+
+pub fn create_event(manual_reset: bool, initial_state: bool) -> u32 {
+    let mut objects = OBJECTS.lock();
+    insert_unnamed(
+        &mut objects,
+        ObjectData::Event(EventObject {
+            signaled: initial_state,
+            manual_reset,
+        }),
+    )
+}
+
+pub fn create_section(path: Option<String>, protection: u32, attributes: u32, size: u64) -> u32 {
+    let mut objects = OBJECTS.lock();
+    insert_unnamed(
+        &mut objects,
+        ObjectData::Section(SectionObject {
+            path,
+            protection,
+            attributes,
+            size,
+        }),
+    )
+}
+
+pub fn create_process(pid: u32) -> u32 {
+    let mut objects = OBJECTS.lock();
+    insert_unnamed(&mut objects, ObjectData::Process(ProcessObject { pid }))
+}
+
+pub fn create_thread(pid: u32, tid: usize) -> u32 {
+    let mut objects = OBJECTS.lock();
+    insert_unnamed(&mut objects, ObjectData::Thread(ThreadObject { pid, tid }))
+}
+
+pub fn retain(object_id: u32) -> Result<(), NtStatus> {
+    let mut objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get_mut(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    record.refs = record.refs.saturating_add(1);
+    Ok(())
+}
+
+pub fn release(object_id: u32) -> Result<(), NtStatus> {
+    let mut objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get_mut(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    if record.refs > 1 {
+        record.refs -= 1;
+        return Ok(());
+    }
+    let name = record.name.clone();
+    let data = record.data.clone();
+    objects.objects.remove(&object_id);
+    if let Some(name) = name {
+        objects.named.remove(&name);
+    }
+    drop(objects);
+    if let ObjectData::File(file) = data {
+        let _ = vfs::close(file.vfs_handle);
+    }
+    Ok(())
+}
+
+pub fn object_type(object_id: u32) -> Result<ObjectType, NtStatus> {
+    let objects = OBJECTS.lock();
+    objects
+        .objects
+        .get(&object_id)
+        .map(|record| record.object_type)
+        .ok_or(STATUS_INVALID_HANDLE)
+}
+
+pub fn with_file<T>(object_id: u32, f: impl FnOnce(&FileObject) -> T) -> Result<T, NtStatus> {
+    let objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &record.data {
+        ObjectData::File(file) => Ok(f(file)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_section<T>(object_id: u32, f: impl FnOnce(&SectionObject) -> T) -> Result<T, NtStatus> {
+    let objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &record.data {
+        ObjectData::Section(section) => Ok(f(section)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_event_mut<T>(object_id: u32, f: impl FnOnce(&mut EventObject) -> T) -> Result<T, NtStatus> {
+    let mut objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get_mut(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &mut record.data {
+        ObjectData::Event(event) => Ok(f(event)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn resolve_nt_path(input: &str) -> Result<String, NtStatus> {
+    init_namespace();
+    let canonical = canonicalize_nt_path(input);
+    if canonical.is_empty() {
+        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+
+    let resolved = resolve_named_path(&canonical, 0)?;
+    if let Some(rest) = resolved.strip_prefix("\\Device\\Crabfs0") {
+        let rest = rest.replace('\\', "/");
+        if rest.is_empty() {
+            return Ok("/".to_string());
+        }
+        if rest.starts_with('/') {
+            return Ok(rest);
+        }
+        return Ok(format!("/{}", rest));
+    }
+
+    Err(STATUS_OBJECT_PATH_NOT_FOUND)
+}
+
+fn resolve_named_path(path: &str, depth: usize) -> Result<String, NtStatus> {
+    if depth > 16 {
+        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+    let objects = OBJECTS.lock();
+    if let Some(id) = objects.named.get(path).copied() {
+        if let Some(record) = objects.objects.get(&id) {
+            if let ObjectData::SymbolicLink { target } = &record.data {
+                let target = target.clone();
+                drop(objects);
+                return resolve_named_path(&target, depth + 1);
+            }
+            return Ok(path.to_string());
+        }
+    }
+
+    let mut best_prefix = None;
+    for prefix in objects.named.keys() {
+        if path == prefix || !path.starts_with(prefix) {
+            continue;
+        }
+        let boundary = path.as_bytes().get(prefix.len()).copied();
+        if boundary != Some(b'\\') {
+            continue;
+        }
+        if best_prefix
+            .as_ref()
+            .is_none_or(|existing: &&String| prefix.len() > existing.len())
+        {
+            best_prefix = Some(prefix);
+        }
+    }
+
+    let Some(prefix) = best_prefix.cloned() else {
+        return Ok(path.to_string());
+    };
+    let id = objects.named[&prefix];
+    let Some(record) = objects.objects.get(&id) else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    let suffix = &path[prefix.len()..];
+    match &record.data {
+        ObjectData::SymbolicLink { target } => {
+            let next = format!("{}{}", target, suffix);
+            drop(objects);
+            resolve_named_path(&next, depth + 1)
+        }
+        _ => Ok(path.to_string()),
+    }
+}
+
+pub fn canonicalize_nt_path(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut path = input.replace('/', "\\");
+    if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        path = format!("\\??\\{}", rest);
+    }
+    if path.len() >= 2 && path.as_bytes()[1] == b':' && path.as_bytes()[0].is_ascii_alphabetic() {
+        path = format!("\\??\\{}", path);
+    } else if !path.starts_with('\\') {
+        path = format!("\\{}", path);
+    }
+    while path.contains("\\\\") {
+        path = path.replace("\\\\", "\\");
+    }
+    if path.len() > 1 && path.ends_with('\\') {
+        path.pop();
+    }
+    path
+}

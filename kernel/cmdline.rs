@@ -39,7 +39,7 @@ pub fn resolved_init_path() -> String {
     params()
         .init
         .clone()
-        .unwrap_or_else(|| "/usr/bin/bash".to_string())
+        .unwrap_or_else(|| "\\SystemRoot\\System32\\init.exe".to_string())
 }
 
 pub fn resolved_root_device() -> Option<RootDevice> {

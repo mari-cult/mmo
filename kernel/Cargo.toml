@@ -19,6 +19,7 @@ pic8259 = { workspace = true }
 linked_list_allocator = { workspace = true }
 lz4_flex = { workspace = true }
 uefi = { workspace = true }
+bitflags = { workspace = true }
 
 [lints]
 workspace = true

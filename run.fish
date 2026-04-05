@@ -48,6 +48,10 @@ end
 
 set -g KERNEL_BIN "target/$TARGET/debug/kernel"
 set -g ROOTFS_IMG "rootfs.img"
+set -g NATIVE_INIT_DIR "userspace/native_init"
+set -g NATIVE_INIT_OBJ "native_init.obj"
+set -g NATIVE_INIT_STUBS "native_init_stubs.obj"
+set -g NATIVE_INIT_EXE "init.exe"
 set -q GENTOO_STAGE3_TARBALL; or set GENTOO_STAGE3_TARBALL ""
 set -q GENTOO_STAGE3_STAGING; or set GENTOO_STAGE3_STAGING "stage3-root"
 set -q KERNEL_INIT; or set KERNEL_INIT ""
@@ -65,7 +69,7 @@ function resolve_rootfs_size_mib
     end
 
     set -l used_mib (du -sm "$source_dir" | awk '{print $1}')
-    set -l size_mib (math "$used_mib + $used_mib / 4 + 256")
+    set -l size_mib (math -s0 "$used_mib + $used_mib / 4 + 256")
     if test "$size_mib" -lt 64
         set size_mib 64
     end
@@ -85,6 +89,21 @@ function build_rootfs_from_dir
         --size-mib "$size_mib"
 end
 
+function build_native_init
+    echo "Building native PE32+ init.exe..."
+    clang --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -fno-builtin \
+        -c "$NATIVE_INIT_DIR/init.c" -o "$NATIVE_INIT_OBJ"
+    clang --target=x86_64-pc-windows-msvc -c "$NATIVE_INIT_DIR/syscall_stubs.S" -o "$NATIVE_INIT_STUBS"
+    lld-link /entry:start /subsystem:native /nodefaultlib /machine:x64 \
+        /out:"$NATIVE_INIT_EXE" "$NATIVE_INIT_OBJ" "$NATIVE_INIT_STUBS"
+end
+
+function install_native_init_to_dir
+    set -l target_dir $argv[1]
+    mkdir -p "$target_dir/Windows/System32"
+    cp "$NATIVE_INIT_EXE" "$target_dir/Windows/System32/init.exe"
+end
+
 function rootfs_has_crabfs_superblock
     set -l img $argv[1]
     if not test -f "$img"
@@ -98,16 +117,22 @@ function rootfs_has_crabfs_superblock
     end
 end
 
+build_native_init
+
 if test -n "$GENTOO_STAGE3_TARBALL"
     echo "Importing Gentoo stage3 into $ROOTFS_IMG..."
     ./tools/import_rootfs.sh "$GENTOO_STAGE3_TARBALL" "$GENTOO_STAGE3_STAGING" "$ROOTFS_IMG"
+    install_native_init_to_dir "$GENTOO_STAGE3_STAGING"
+    build_rootfs_from_dir "$GENTOO_STAGE3_STAGING" "$ROOTFS_IMG"
 else if test -d "$GENTOO_STAGE3_STAGING"
     echo "Packing existing rootfs tree from $GENTOO_STAGE3_STAGING into $ROOTFS_IMG..."
+    install_native_init_to_dir "$GENTOO_STAGE3_STAGING"
     build_rootfs_from_dir "$GENTOO_STAGE3_STAGING" "$ROOTFS_IMG"
-else if not rootfs_has_crabfs_superblock "$ROOTFS_IMG"
-    echo "Creating minimal crabfs rootfs image at $ROOTFS_IMG..."
+else
+    echo "Creating NT rootfs image at $ROOTFS_IMG..."
     rm -rf "$EMPTY_ROOTFS_DIR"
-    mkdir -p "$EMPTY_ROOTFS_DIR"
+    mkdir -p "$EMPTY_ROOTFS_DIR/Windows/System32"
+    install_native_init_to_dir "$EMPTY_ROOTFS_DIR"
     build_rootfs_from_dir "$EMPTY_ROOTFS_DIR" "$ROOTFS_IMG"
 end
 
@@ -130,7 +155,7 @@ end
 echo "timeout: 0
 verbose: yes
 
-/Linux-Like Kernel
+/NT Kernel
     protocol: limine
     path: boot():/kernel
     cmdline: $KERNEL_CMDLINE" > "$EFI_ROOT/limine.conf"

@@ -13,6 +13,7 @@ pub mod cmdline;
 pub mod gdt;
 pub mod idt;
 pub mod log;
+pub mod nt;
 pub mod paging;
 pub mod pci;
 pub mod process;
@@ -85,7 +86,7 @@ fn efi_main(
     system_table: uefi::table::SystemTable<uefi::table::Boot>,
 ) -> uefi::Status {
     uefi::helpers::init().unwrap();
-    println!("LINUX-LIKE KERNEL: Booted via EFI STUB!");
+    println!("NT KERNEL: Booted via EFI STUB!");
 
     // Allocate a heap from UEFI
     let heap_pages = (allocator::HEAP_SIZE + 4095) / 4096;
@@ -105,7 +106,7 @@ fn efi_main(
     }
 
     println!(
-        "LINUX-LIKE KERNEL: Heap initialized via UEFI at {:p}",
+        "NT KERNEL: Heap initialized via UEFI at {:p}",
         heap_ptr as *const u8
     );
 
@@ -125,10 +126,10 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe {
         asm!("cli");
     }
-    println!("LINUX-LIKE KERNEL: Initializing (CPU INTERRUPTS DISABLED)...");
+    println!("NT KERNEL: Initializing (CPU INTERRUPTS DISABLED)...");
     if BASE_REVISION.is_valid() {
         println!(
-            "LINUX-LIKE KERNEL: Limine base revision loaded={}",
+            "NT KERNEL: Limine base revision loaded={}",
             BASE_REVISION.loaded_revision().unwrap_or(0)
         );
     }
@@ -147,11 +148,11 @@ pub extern "C" fn kernel_main() -> ! {
         }
     } else {
         println!(
-            "LINUX-LIKE KERNEL: No Limine response. Continuing with UEFI stub initialization..."
+            "NT KERNEL: No Limine response. Continuing with UEFI stub initialization..."
         );
     }
 
-    println!("LINUX-LIKE KERNEL: Heap initialized.");
+    println!("NT KERNEL: Heap initialized.");
     let params = cmdline::params();
     log::init(params);
     if !params.raw.is_empty() {
@@ -168,17 +169,17 @@ pub extern "C" fn kernel_main() -> ! {
     idt::init();
     init_local_cpu_features();
     apic::init();
-    println!("LINUX-LIKE KERNEL: GDT/IDT/APIC initialized.");
+    println!("NT KERNEL: GDT/IDT/APIC initialized.");
 
     let topology = smp::init();
     process::configure_topology(topology.online_cpus);
     println!(
-        "LINUX-LIKE KERNEL: SMP topology online_cpus={}, discovered_cpus={}, bsp_lapic_id={}",
+        "NT KERNEL: SMP topology online_cpus={}, discovered_cpus={}, bsp_lapic_id={}",
         topology.online_cpus, topology.discovered_cpus, topology.bootstrap_lapic_id
     );
 
     syscall::init();
-    println!("LINUX-LIKE KERNEL: Syscalls initialized.");
+    println!("NT KERNEL: Syscalls initialized.");
 
     let mut init_task = None;
     match (
@@ -187,79 +188,37 @@ pub extern "C" fn kernel_main() -> ! {
         virtio_blk::VirtioBlkDevice::probe(),
     ) {
         (Some(cmdline::RootDevice::VirtioBlk0), Some(cmdline::RootFsType::Crabfs), Ok(dev)) => {
-            println!("LINUX-LIKE KERNEL: PCI found modern virtio-blk");
+            println!("NT KERNEL: PCI found modern virtio-blk");
             match vfs::mount_root(dev) {
                 Ok(()) => {
-                    println!("LINUX-LIKE KERNEL: crabfs root mounted");
-                    println!(
-                        "LINUX-LIKE KERNEL: lookup libc={} readline={} ncursesw={} tinfow={}",
-                        vfs::lookup("/usr/lib/libc.so").is_ok(),
-                        vfs::lookup("/usr/lib/libreadline.so.8").is_ok(),
-                        vfs::lookup("/usr/lib/libncursesw.so.6").is_ok(),
-                        vfs::lookup("/usr/lib/libtinfow.so.6").is_ok()
-                    );
-                    for path in [
-                        "/usr/bin/clear",
-                        "/usr/bin/bash",
-                        "/usr/lib/ld-musl-x86_64.so.1",
-                        "/lib/ld-musl-x86_64.so.1",
-                        "/usr/lib/libtinfotw.so.6",
-                        "/lib/libtinfotw.so.6",
-                        "/usr/lib/libc.so",
-                        "/usr/lib/libreadline.so.8",
-                        "/usr/lib/libncursesw.so.6",
-                        "/usr/lib/libtinfow.so.6",
-                    ] {
-                        let _ = vfs::cache_path(path);
-                        match vfs::stat_path(path, true) {
-                            Ok(st) => {
-                                println!(
-                                    "LINUX-LIKE KERNEL: stat path={} ino={} mode={:#o} size={}",
-                                    path, st.ino, st.mode, st.size
-                                );
-                            }
-                            Err(err) => {
-                                println!("LINUX-LIKE KERNEL: stat path={} err={:?}", path, err);
-                            }
-                        }
-                    }
-                    let _ = vfs::cache_missing_path("/usr/etc/ld-musl-x86_64.path");
-                    if let Ok(path_bytes) = vfs::read_all("/etc/ld-musl-x86_64.path") {
-                        if let Ok(path_text) = core::str::from_utf8(&path_bytes) {
-                            println!("LINUX-LIKE KERNEL: ld-musl path file={:?}", path_text);
-                        }
-                    }
+                    println!("NT KERNEL: crabfs root mounted");
                     let init_path = cmdline::resolved_init_path();
-                    user::debug_file_elf(&init_path);
-                    user::debug_file_elf("/lib/ld-musl-x86_64.so.1");
-                    user::debug_file_elf("/usr/lib/libtinfotw.so.6");
-                    user::debug_file_elf("/lib/libtinfotw.so.6");
                     match user::create_init_task(3, &init_path) {
                         Ok(task) => {
-                            println!("LINUX-LIKE KERNEL: PID1 {} task prepared", init_path);
+                            println!("NT KERNEL: native init {} task prepared", init_path);
                             init_task = Some(task);
                         }
                         Err(err) => {
                             println!(
-                                "LINUX-LIKE KERNEL: PID1 {} prepare failed: {:?}",
+                                "NT KERNEL: native init {} prepare failed: {:#x}",
                                 init_path, err
                             );
                         }
                     }
                 }
                 Err(_) => {
-                    println!("LINUX-LIKE KERNEL: crabfs mount failed");
+                    println!("NT KERNEL: crabfs mount failed");
                 }
             }
         }
         (None, _, _) => {
-            println!("LINUX-LIKE KERNEL: unsupported root= parameter");
+            println!("NT KERNEL: unsupported root= parameter");
         }
         (_, None, _) => {
-            println!("LINUX-LIKE KERNEL: unsupported rootfstype= parameter");
+            println!("NT KERNEL: unsupported rootfstype= parameter");
         }
         (_, _, Err(_)) => {
-            println!("LINUX-LIKE KERNEL: no modern virtio-blk device detected");
+            println!("NT KERNEL: no modern virtio-blk device detected");
         }
     }
 
@@ -304,7 +263,7 @@ pub extern "C" fn kernel_main() -> ! {
 
         let reclaim_stats = reclaim::stats();
         println!(
-            "LINUX-LIKE KERNEL: reclaim allocated_pages={}, resident_pages={}, compressed_pages={}, reclaims={}, restored_faults={}",
+            "NT KERNEL: reclaim allocated_pages={}, resident_pages={}, compressed_pages={}, reclaims={}, restored_faults={}",
             reclaim_stats.allocated_pages,
             reclaim_stats.resident_pages,
             reclaim_stats.compressed_pages,
@@ -312,7 +271,7 @@ pub extern "C" fn kernel_main() -> ! {
             reclaim_stats.restored_faults
         );
     } else {
-        println!("LINUX-LIKE KERNEL: reclaim demo unavailable without Limine memory services");
+        println!("NT KERNEL: reclaim demo unavailable without Limine memory services");
     }
 
     if false {
@@ -355,7 +314,7 @@ pub extern "C" fn kernel_main() -> ! {
         let zram_stats = zram_device.stats();
         let zswap_stats = zswap_cache.stats();
         println!(
-            "LINUX-LIKE KERNEL: zram stores={}, loads={}, raw_pages={}, compressed_pages={}, logical_bytes={}, stored_bytes={}, zspages={}",
+            "NT KERNEL: zram stores={}, loads={}, raw_pages={}, compressed_pages={}, logical_bytes={}, stored_bytes={}, zspages={}",
             zram_stats.stores,
             zram_stats.loads,
             zram_stats.raw_pages,
@@ -365,14 +324,14 @@ pub extern "C" fn kernel_main() -> ! {
             zram_stats.allocator.zspages
         );
         println!(
-            "LINUX-LIKE KERNEL: zswap hits={}, misses={}, backend_invalidations={}",
+            "NT KERNEL: zswap hits={}, misses={}, backend_invalidations={}",
             zswap_stats.hits, zswap_stats.misses, zswap_stats.backend.invalidations
         );
     }
 
     if let Some(task) = init_task {
         process::SCHEDULER.lock().add_task(task);
-        println!("LINUX-LIKE KERNEL: added PID1 userspace task");
+        println!("NT KERNEL: added PID1 userspace task");
     } else {
         let task1 = process::Task::with_params(
             1,
@@ -389,10 +348,10 @@ pub extern "C" fn kernel_main() -> ! {
 
         process::SCHEDULER.lock().add_task(task1);
         process::SCHEDULER.lock().add_task(task2);
-        println!("LINUX-LIKE KERNEL: using fallback kernel demo tasks");
+        println!("NT KERNEL: using fallback kernel demo tasks");
     }
 
-    println!("LINUX-LIKE KERNEL: Starting scheduler...");
+    println!("NT KERNEL: Starting scheduler...");
     crate::process::start();
 }
 
