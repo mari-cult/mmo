@@ -279,6 +279,21 @@ fn region_is_free(start: u64, len: u64) -> bool {
     !mappings.into_iter().any(|virt| virt >= start && virt < end)
 }
 
+fn mapped_region_len(start: u64) -> Option<u64> {
+    with_current_address_space(|space| {
+        if !space.mappings.contains_key(&start) {
+            return None;
+        }
+        let mut len = 0u64;
+        let mut cursor = start;
+        while space.mappings.contains_key(&cursor) {
+            len = len.saturating_add(PAGE_SIZE);
+            cursor = cursor.saturating_add(PAGE_SIZE);
+        }
+        Some(len)
+    })
+}
+
 fn pml4_index(addr: u64) -> usize {
     ((addr >> 39) & 0x1ff) as usize
 }
@@ -801,6 +816,18 @@ fn path_from_object_attributes(attributes: *const ObjectAttributes) -> Result<St
     read_utf16_string(attrs.object_name)
 }
 
+fn nt_path_from_vfs_path(path: &str) -> Option<String> {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.starts_with("/windows/system32/") {
+        let base = module_basename(path);
+        return Some(nt::canonicalize_nt_path(&format!(
+            "\\SystemRoot\\System32\\{}",
+            base
+        )));
+    }
+    None
+}
+
 pub fn create_file(
     out_handle: *mut Handle,
     _desired_access: AccessMask,
@@ -1197,7 +1224,7 @@ pub fn query_system_time(system_time: *mut i64) -> NtStatus {
 pub fn create_section(
     out_handle: *mut Handle,
     _desired_access: AccessMask,
-    _object_attributes: *const ObjectAttributes,
+    object_attributes: *const ObjectAttributes,
     maximum_size: *const i64,
     protection: u32,
     attributes: u32,
@@ -1218,12 +1245,56 @@ pub fn create_section(
     } else {
         None
     };
+    let nt_path = path.as_deref().and_then(nt_path_from_vfs_path);
+    let name = if object_attributes.is_null() {
+        None
+    } else {
+        Some(match path_from_object_attributes(object_attributes) {
+            Ok(name) => name,
+            Err(status) => return status,
+        })
+    };
     let size = if maximum_size.is_null() {
         0
     } else {
         unsafe { *maximum_size }.max(0) as u64
     };
-    let object_id = nt::create_section(path, protection, attributes, size);
+    let object_id = if let Some(name) = name {
+        match nt::create_named_section(&name, nt_path, path, protection, attributes, size) {
+            Ok(object_id) => object_id,
+            Err(status) => return status,
+        }
+    } else {
+        nt::create_section(nt_path, path, protection, attributes, size)
+    };
+    let handle = match install_handle(object_id, nt::SECTION_ALL_ACCESS) {
+        Ok(handle) => handle,
+        Err(status) => {
+            let _ = nt::release(object_id);
+            return status;
+        }
+    };
+    let _ = nt::release(object_id);
+    unsafe { *out_handle = handle };
+    STATUS_SUCCESS
+}
+
+pub fn open_section(
+    out_handle: *mut Handle,
+    _desired_access: AccessMask,
+    object_attributes: *const ObjectAttributes,
+) -> NtStatus {
+    if out_handle.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let name = match path_from_object_attributes(object_attributes) {
+        Ok(name) => name,
+        Err(status) => return status,
+    };
+    let object_id = match nt::open_section(&name) {
+        Ok(object_id) => object_id,
+        Err(status) => return status,
+    };
     let handle = match install_handle(object_id, nt::SECTION_ALL_ACCESS) {
         Ok(handle) => handle,
         Err(status) => {
@@ -1255,7 +1326,21 @@ pub fn map_view_of_section(
         Err(status) => return status,
     };
     if (section.attributes & nt::SEC_IMAGE) != 0 {
-        return STATUS_NOT_IMPLEMENTED;
+        if unsafe { *base_address } != 0 {
+            return STATUS_NOT_IMPLEMENTED;
+        }
+        let Some(nt_path) = section.nt_path.as_deref() else {
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        };
+        let image = match map_image_view(nt_path) {
+            Ok(image) => image,
+            Err(status) => return status,
+        };
+        unsafe {
+            *base_address = image.image_base as usize;
+            *view_size = image.size_of_image as usize;
+        }
+        return STATUS_SUCCESS;
     }
     let size = unsafe { *view_size }.max(section.size as usize);
     let status = allocate_virtual_memory(process_handle, base_address, view_size, win32_protect);
@@ -1285,7 +1370,10 @@ pub fn map_view_of_section(
 
 pub fn unmap_view_of_section(process_handle: Handle, base_address: usize) -> NtStatus {
     let mut base = base_address;
-    let mut size = PAGE_SIZE as usize;
+    let Some(region_len) = mapped_region_len(base_address as u64) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let mut size = region_len as usize;
     let _ = process_handle;
     free_virtual_memory(usize::MAX, &mut base, &mut size)
 }
@@ -1683,12 +1771,33 @@ fn load_module(nt_path: &str) -> Result<LoadedImage, NtStatus> {
         });
     }
 
-    let vfs_path = match nt::resolve_nt_path(&canonical_path) {
+    let template = module_template(&canonical_path)?;
+    let image = load_pe_image(&canonical_path, &template)?;
+    with_current_process(|current| {
+        current.modules.push(LoadedModule {
+            nt_path: canonical_path,
+            dll_name: image.dll_name.clone(),
+            image_base: image.image_base,
+            entry: image.entry,
+            size_of_image: image.size_of_image,
+            exports_by_name: Arc::clone(&image.exports_by_name),
+            exports_by_ordinal: Arc::clone(&image.exports_by_ordinal),
+        });
+    });
+    Ok(image)
+}
+
+fn module_template(canonical_path: &str) -> Result<Arc<ModuleTemplate>, NtStatus> {
+    if let Some(template) = MODULE_TEMPLATES.lock().get(canonical_path).cloned() {
+        return Ok(template);
+    }
+
+    let vfs_path = match nt::resolve_nt_path(canonical_path) {
         Ok(path) => path,
         Err(status) => {
             println!(
-                "NT KERNEL: load_module path resolve failed nt_path={} canonical={} status={:#x}",
-                nt_path, canonical_path, status
+                "NT KERNEL: load_module path resolve failed canonical={} status={:#x}",
+                canonical_path, status
             );
             return Err(status);
         }
@@ -1712,38 +1821,26 @@ fn load_module(nt_path: &str) -> Result<LoadedImage, NtStatus> {
                 Some(bytes) => bytes,
                 None => {
                     println!(
-                        "NT KERNEL: load_module path={} vfs_path={} read_all failed: {:?}",
-                        nt_path, vfs_path, err_primary
+                        "NT KERNEL: load_module canonical={} vfs_path={} read_all failed: {:?}",
+                        canonical_path, vfs_path, err_primary
                     );
                     return Err(STATUS_OBJECT_NAME_NOT_FOUND);
                 }
             }
         }
     };
-    let template = {
-        if let Some(template) = MODULE_TEMPLATES.lock().get(&canonical_path).cloned() {
-            template
-        } else {
-            let template = Arc::new(build_module_template(&canonical_path, &bytes)?);
-            MODULE_TEMPLATES
-                .lock()
-                .insert(canonical_path.clone(), Arc::clone(&template));
-            template
-        }
-    };
-    let image = load_pe_image(&canonical_path, &template)?;
-    with_current_process(|current| {
-        current.modules.push(LoadedModule {
-            nt_path: canonical_path,
-            dll_name: image.dll_name.clone(),
-            image_base: image.image_base,
-            entry: image.entry,
-            size_of_image: image.size_of_image,
-            exports_by_name: Arc::clone(&image.exports_by_name),
-            exports_by_ordinal: Arc::clone(&image.exports_by_ordinal),
-        });
-    });
-    Ok(image)
+
+    let template = Arc::new(build_module_template(canonical_path, &bytes)?);
+    MODULE_TEMPLATES
+        .lock()
+        .insert(canonical_path.to_string(), Arc::clone(&template));
+    Ok(template)
+}
+
+fn map_image_view(nt_path: &str) -> Result<LoadedImage, NtStatus> {
+    let canonical_path = canonical_module_path(nt_path);
+    let template = module_template(&canonical_path)?;
+    load_pe_image(&canonical_path, &template)
 }
 
 fn build_module_template(nt_path: &str, bytes: &[u8]) -> Result<ModuleTemplate, NtStatus> {

@@ -263,6 +263,11 @@ extern "sysv64" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             user::delay_execution(frame.a0 != 0, frame.a1 as *const i64) as usize
         }
         nt::SYSCALL_NT_QUERY_SYSTEM_TIME => user::query_system_time(frame.a0 as *mut i64) as usize,
+        nt::SYSCALL_NT_OPEN_SECTION => user::open_section(
+            frame.a0 as *mut usize,
+            frame.a1 as u32,
+            frame.a2 as *const nt::ObjectAttributes,
+        ) as usize,
         _ => nt::STATUS_NOT_IMPLEMENTED as usize,
     }
 }

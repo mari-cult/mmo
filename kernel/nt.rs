@@ -101,6 +101,7 @@ pub const SYSCALL_NT_TERMINATE_PROCESS: usize = 17;
 pub const SYSCALL_NT_TERMINATE_THREAD: usize = 18;
 pub const SYSCALL_NT_DELAY_EXECUTION: usize = 19;
 pub const SYSCALL_NT_QUERY_SYSTEM_TIME: usize = 20;
+pub const SYSCALL_NT_OPEN_SECTION: usize = 21;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -274,6 +275,7 @@ pub struct EventObject {
 
 #[derive(Debug, Clone)]
 pub struct SectionObject {
+    pub nt_path: Option<String>,
     pub path: Option<String>,
     pub protection: u32,
     pub attributes: u32,
@@ -426,17 +428,86 @@ pub fn create_event(manual_reset: bool, initial_state: bool) -> u32 {
     )
 }
 
-pub fn create_section(path: Option<String>, protection: u32, attributes: u32, size: u64) -> u32 {
+pub fn create_section(
+    nt_path: Option<String>,
+    path: Option<String>,
+    protection: u32,
+    attributes: u32,
+    size: u64,
+) -> u32 {
     let mut objects = OBJECTS.lock();
     insert_unnamed(
         &mut objects,
         ObjectData::Section(SectionObject {
+            nt_path,
             path,
             protection,
             attributes,
             size,
         }),
     )
+}
+
+pub fn create_named_section(
+    name: &str,
+    nt_path: Option<String>,
+    path: Option<String>,
+    protection: u32,
+    attributes: u32,
+    size: u64,
+) -> Result<u32, NtStatus> {
+    let mut objects = OBJECTS.lock();
+    create_named(
+        &mut objects,
+        name,
+        ObjectData::Section(SectionObject {
+            nt_path,
+            path,
+            protection,
+            attributes,
+            size,
+        }),
+    )
+}
+
+pub fn open_section(name: &str) -> Result<u32, NtStatus> {
+    init_namespace();
+    let canonical = canonicalize_nt_path(name);
+    {
+        let mut objects = OBJECTS.lock();
+        if let Some(id) = objects.named.get(&canonical).copied() {
+            let Some(record) = objects.objects.get_mut(&id) else {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            };
+            if record.object_type != ObjectType::Section {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+            record.refs = record.refs.saturating_add(1);
+            return Ok(id);
+        }
+    }
+
+    if canonical.starts_with("\\KnownDlls\\") {
+        let dll_name = canonical
+            .rsplit('\\')
+            .next()
+            .filter(|name| !name.is_empty())
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let nt_path = canonicalize_nt_path(&format!("\\SystemRoot\\System32\\{}", dll_name));
+        let path = resolve_nt_path(&nt_path)?;
+        let id = create_named_section(
+            &canonical,
+            Some(nt_path),
+            Some(path),
+            PAGE_EXECUTE_READ,
+            SEC_IMAGE,
+            0,
+        )?;
+        retain(id)?;
+        return Ok(id);
+    }
+
+    Err(STATUS_OBJECT_NAME_NOT_FOUND)
 }
 
 pub fn create_process(pid: u32) -> u32 {

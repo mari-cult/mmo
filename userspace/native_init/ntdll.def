@@ -21,4 +21,5 @@ EXPORTS
     NtTerminateThread
     NtDelayExecution
     NtQuerySystemTime
+    NtOpenSection
     NtdllRelocAnchorData DATA

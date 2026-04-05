@@ -34,3 +34,6 @@ nt_stub NtWaitForSingleObject, 15
 nt_stub NtCreateUserProcess, 16
 nt_stub NtTerminateProcess, 17
 nt_stub NtTerminateThread, 18
+nt_stub NtDelayExecution, 19
+nt_stub NtQuerySystemTime, 20
+nt_stub NtOpenSection, 21

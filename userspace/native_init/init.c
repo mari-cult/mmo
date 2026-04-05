@@ -139,6 +139,24 @@ extern NTSTATUS NtCreateUserProcess(
 );
 extern NTSTATUS NtDelayExecution(BOOLEAN Alertable, i64 *DelayInterval);
 extern NTSTATUS NtQuerySystemTime(i64 *SystemTime);
+extern NTSTATUS NtOpenSection(
+    HANDLE *SectionHandle,
+    u32 DesiredAccess,
+    OBJECT_ATTRIBUTES *ObjectAttributes
+);
+extern NTSTATUS NtMapViewOfSection(
+    HANDLE SectionHandle,
+    HANDLE ProcessHandle,
+    void **BaseAddress,
+    unsigned long long ZeroBits,
+    unsigned long long CommitSize,
+    i64 *SectionOffset,
+    SIZE_T *ViewSize,
+    u32 InheritDisposition,
+    u32 AllocationType,
+    u32 Win32Protect
+);
+extern NTSTATUS NtUnmapViewOfSection(HANDLE ProcessHandle, void *BaseAddress);
 extern NTSTATUS NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus);
 
 static void init_unicode_string(UNICODE_STRING *out, u16 *buffer) {
@@ -186,16 +204,21 @@ void start(void) {
         '\\','S','y','s','t','e','m','R','o','o','t','\\','S','y','s','t','e','m','3','2','\\',
         'c','h','i','l','d','.','e','x','e',0
     };
+    static u16 known_dll_path[] = {
+        '\\','K','n','o','w','n','D','l','l','s','\\','n','t','d','l','l','.','d','l','l',0
+    };
 
     HANDLE stdout_handle = query_stdout();
     HANDLE file = 0;
     HANDLE event = 0;
+    HANDLE known_dll = 0;
     HANDLE child_process = 0;
     HANDLE child_thread = 0;
     IO_STATUS_BLOCK iosb;
     OBJECT_ATTRIBUTES attrs;
     UNICODE_STRING path;
     UNICODE_STRING child_us;
+    UNICODE_STRING known_dll_us;
     char buffer[96];
     long previous_state = 0;
     NTSTATUS status;
@@ -203,8 +226,11 @@ void start(void) {
     i64 system_time_before = 0;
     i64 system_time_after = 0;
     i64 delay_interval = -100000;
+    void *mapped_base = NULL;
+    SIZE_T mapped_size = 0;
 
     init_unicode_string(&path, init_path);
+    init_unicode_string(&known_dll_us, known_dll_path);
     attrs.Length = (u32)sizeof(attrs);
     attrs.RootDirectory = 0;
     attrs.ObjectName = &path;
@@ -222,6 +248,33 @@ void start(void) {
             write_console(stdout_handle, "native init: time query/delay succeeded\r\n");
         }
     }
+
+    attrs.ObjectName = &known_dll_us;
+    status = NtOpenSection(&known_dll, 0x000f001fu, &attrs);
+    if (status == STATUS_SUCCESS) {
+        status = NtMapViewOfSection(
+            known_dll,
+            (HANDLE)-1,
+            &mapped_base,
+            0,
+            0,
+            NULL,
+            &mapped_size,
+            1,
+            0,
+            0x20
+        );
+        if (status == STATUS_SUCCESS && mapped_base != NULL &&
+            ((u8 *)mapped_base)[0] == 'M' && ((u8 *)mapped_base)[1] == 'Z') {
+            write_console(stdout_handle, "native init: known dll section map succeeded\r\n");
+        }
+        if (mapped_base != NULL) {
+            NtUnmapViewOfSection((HANDLE)-1, mapped_base);
+        }
+        NtClose(known_dll);
+    }
+
+    attrs.ObjectName = &path;
 
     status = NtCreateFile(
         &file,
