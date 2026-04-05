@@ -30,6 +30,7 @@ pub const STATUS_TIMEOUT: NtStatus = 0x0000_0102u32 as i32;
 pub const STATUS_IMAGE_MACHINE_TYPE_MISMATCH: NtStatus = 0x4000_002Eu32 as i32;
 pub const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007Bu32 as i32;
 pub const STATUS_NOT_SUPPORTED: NtStatus = 0xC000_00BBu32 as i32;
+pub const STATUS_INVALID_DEVICE_REQUEST: NtStatus = 0xC000_0010u32 as i32;
 
 pub const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 pub const SYNCHRONIZE: AccessMask = 0x0010_0000;
@@ -59,6 +60,10 @@ pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
 pub const MEM_RELEASE: u32 = 0x8000;
+pub const MEM_FREE: u32 = 0x10000;
+pub const MEM_PRIVATE: u32 = 0x20000;
+pub const MEM_MAPPED: u32 = 0x40000;
+pub const MEM_IMAGE: u32 = 0x1000000;
 
 pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
 pub const FILE_OPEN: u32 = 0x0000_0001;
@@ -73,6 +78,7 @@ pub const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
 pub const FILE_STANDARD_INFORMATION_CLASS: u32 = 5;
 pub const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
 pub const FILE_NAME_INFORMATION_CLASS: u32 = 9;
+pub const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
 
 pub const EVENT_TYPE_NOTIFICATION: u32 = 0;
 pub const EVENT_TYPE_SYNCHRONIZATION: u32 = 1;
@@ -102,6 +108,27 @@ pub const SYSCALL_NT_TERMINATE_THREAD: usize = 18;
 pub const SYSCALL_NT_DELAY_EXECUTION: usize = 19;
 pub const SYSCALL_NT_QUERY_SYSTEM_TIME: usize = 20;
 pub const SYSCALL_NT_OPEN_SECTION: usize = 21;
+pub const SYSCALL_NT_DEVICE_IO_CONTROL_FILE: usize = 22;
+pub const SYSCALL_NT_QUERY_VIRTUAL_MEMORY: usize = 23;
+pub const SYSCALL_NT_YIELD_EXECUTION: usize = 24;
+pub const SYSCALL_NT_CLEAR_EVENT: usize = 25;
+pub const SYSCALL_NT_RESET_EVENT: usize = 26;
+pub const SYSCALL_NT_CREATE_THREAD_EX: usize = 27;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MemoryBasicInformation {
+    pub base_address: usize,
+    pub allocation_base: usize,
+    pub allocation_protect: u32,
+    pub partition_id: u16,
+    pub shared_reserved: u16,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub type_: u32,
+    pub padding: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

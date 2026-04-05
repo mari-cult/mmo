@@ -1075,6 +1075,39 @@ pub fn set_event(handle: Handle, previous_state: *mut i32) -> NtStatus {
     }
 }
 
+pub fn clear_event(handle: Handle) -> NtStatus {
+    let entry = match resolve_handle_entry(handle) {
+        Ok(entry) => entry,
+        Err(status) => return status,
+    };
+    match nt::with_event_mut(entry.object_id, |event| {
+        event.signaled = false;
+    }) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    }
+}
+
+pub fn reset_event(handle: Handle, previous_state: *mut i32) -> NtStatus {
+    let entry = match resolve_handle_entry(handle) {
+        Ok(entry) => entry,
+        Err(status) => return status,
+    };
+    match nt::with_event_mut(entry.object_id, |event| {
+        let old = i32::from(event.signaled);
+        event.signaled = false;
+        old
+    }) {
+        Ok(old) => {
+            if !previous_state.is_null() {
+                unsafe { *previous_state = old };
+            }
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
 fn consume_waitable_signal(object_id: u32) -> Result<bool, NtStatus> {
     if let Ok(signaled) = nt::with_event_mut(object_id, |event| {
         if event.signaled {
@@ -1217,6 +1250,14 @@ pub fn query_system_time(system_time: *mut i64) -> NtStatus {
     let value = NT_EPOCH_OFFSET_100NS.saturating_add(ticks.saturating_mul(SCHED_TICK_100NS));
     unsafe {
         *system_time = value;
+    }
+    STATUS_SUCCESS
+}
+
+pub fn yield_execution() -> NtStatus {
+    process::yield_current();
+    unsafe {
+        core::arch::asm!("int 0x20", options(nomem, preserves_flags));
     }
     STATUS_SUCCESS
 }
@@ -1376,6 +1417,113 @@ pub fn unmap_view_of_section(process_handle: Handle, base_address: usize) -> NtS
     let mut size = region_len as usize;
     let _ = process_handle;
     free_virtual_memory(usize::MAX, &mut base, &mut size)
+}
+
+pub fn device_io_control_file(
+    handle: Handle,
+    _event: Handle,
+    _apc_routine: *mut (),
+    _apc_context: *mut (),
+    io_status: *mut IoStatusBlock,
+    io_control_code: u32,
+    _input_buffer: *const u8,
+    _input_buffer_length: u32,
+    _output_buffer: *mut u8,
+    _output_buffer_length: u32,
+) -> NtStatus {
+    let entry = match resolve_handle_entry(handle) {
+        Ok(entry) => entry,
+        Err(status) => return status,
+    };
+    kdebug!(
+        "NT KERNEL: NtDeviceIoControlFile handle={:#x} object_id={} code={:#x}",
+        handle,
+        entry.object_id,
+        io_control_code
+    );
+    if !io_status.is_null() {
+        unsafe {
+            *io_status = IoStatusBlock {
+                status: nt::STATUS_INVALID_DEVICE_REQUEST,
+                information: 0,
+            };
+        }
+    }
+    nt::STATUS_INVALID_DEVICE_REQUEST
+}
+
+pub fn query_virtual_memory(
+    process_handle: Handle,
+    base_address: usize,
+    memory_information_class: u32,
+    memory_information: *mut u8,
+    memory_information_length: usize,
+    return_length: *mut usize,
+) -> NtStatus {
+    if process_handle != usize::MAX || memory_information.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if memory_information_class == nt::MEMORY_BASIC_INFORMATION_CLASS {
+        if memory_information_length < core::mem::size_of::<nt::MemoryBasicInformation>() {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        let asid = current_address_space_id();
+        let mut asid_mappings = address_space_mappings(asid);
+        asid_mappings.sort_by_key(|m| m.start);
+
+        let target_virt = align_down(base_address as u64, PAGE_SIZE);
+        let mut info = nt::MemoryBasicInformation::default();
+
+        if let Some(pos) = asid_mappings.iter().position(|m| m.start == target_virt) {
+            let prot = asid_mappings[pos].prot;
+            let mut start_idx = pos;
+            while start_idx > 0
+                && asid_mappings[start_idx - 1].start == asid_mappings[start_idx].start - PAGE_SIZE
+                && asid_mappings[start_idx - 1].prot == prot
+            {
+                start_idx -= 1;
+            }
+            let alloc_base = asid_mappings[start_idx].start;
+
+            let mut end_idx = pos;
+            while end_idx + 1 < asid_mappings.len()
+                && asid_mappings[end_idx + 1].start == asid_mappings[end_idx].start + PAGE_SIZE
+                && asid_mappings[end_idx + 1].prot == prot
+            {
+                end_idx += 1;
+            }
+            let region_size = asid_mappings[end_idx].start + PAGE_SIZE - target_virt;
+
+            info.base_address = target_virt as usize;
+            info.allocation_base = alloc_base as usize;
+            info.allocation_protect = prot;
+            info.region_size = region_size as usize;
+            info.state = nt::MEM_COMMIT;
+            info.protect = prot;
+            info.type_ = nt::MEM_PRIVATE;
+        } else {
+            info.base_address = target_virt as usize;
+            info.state = nt::MEM_FREE;
+            info.protect = nt::PAGE_NOACCESS;
+            if let Some(next) = asid_mappings.iter().find(|m| m.start > target_virt) {
+                info.region_size = (next.start - target_virt) as usize;
+            } else {
+                info.region_size = (USER_STACK_TOP - target_virt) as usize;
+            }
+        }
+
+        unsafe {
+            *(memory_information as *mut nt::MemoryBasicInformation) = info;
+            if !return_length.is_null() {
+                *return_length = core::mem::size_of::<nt::MemoryBasicInformation>();
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
+    STATUS_NOT_SUPPORTED
 }
 
 pub fn query_information_process(
@@ -1607,6 +1755,80 @@ pub fn create_user_process(
         *process_handle_out = process_handle;
         *thread_handle_out = thread_handle;
     }
+    STATUS_SUCCESS
+}
+
+pub fn create_thread_ex(
+    thread_handle_out: *mut Handle,
+    _desired_access: AccessMask,
+    _object_attributes: *const ObjectAttributes,
+    process_handle: Handle,
+    start_routine: usize,
+    argument: usize,
+    _create_flags: u32,
+    _zero_bits: usize,
+    stack_size: usize,
+    _maximum_stack_size: usize,
+    _attribute_list: *const (),
+) -> NtStatus {
+    if thread_handle_out.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // For now we only support creating threads in the current process
+    if process_handle != usize::MAX {
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    let pid = current_pid_internal();
+    let task_id = process::allocate_task_id();
+
+    let stack_top = if stack_size == 0 {
+        let size = 64 * PAGE_SIZE;
+        match allocate_user_region(size, nt::PAGE_READWRITE) {
+            Ok(base) => base + size,
+            Err(status) => return status,
+        }
+    } else {
+        let size = align_up(stack_size as u64, PAGE_SIZE);
+        match allocate_user_region(size, nt::PAGE_READWRITE) {
+            Ok(base) => base + size,
+            Err(status) => return status,
+        }
+    };
+
+    let thread_object = nt::create_thread(pid, task_id);
+
+    let ctx = process::SavedTaskContext {
+        rip: start_routine,
+        rcx: argument,
+        cs: usize::from(gdt::user_code_selector().0),
+        rflags: 0x202,
+        rsp: align_down(stack_top - 0x20, 16) as usize,
+        ss: usize::from(gdt::user_data_selector().0),
+        ..process::SavedTaskContext::default()
+    };
+
+    process::SCHEDULER.lock().add_task(process::Task::with_initial_context(
+        task_id,
+        0,
+        ctx,
+        process::SchedParams {
+            process_id: pid,
+            ..process::SchedParams::default()
+        },
+    ));
+
+    let handle = match install_handle(thread_object, nt::THREAD_ALL_ACCESS) {
+        Ok(handle) => handle,
+        Err(status) => {
+            let _ = nt::release(thread_object);
+            return status;
+        }
+    };
+    let _ = nt::release(thread_object);
+    unsafe { *thread_handle_out = handle };
+
     STATUS_SUCCESS
 }
 
