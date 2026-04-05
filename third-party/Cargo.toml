@@ -1,16 +1,14 @@
-[workspace]
-members = ["lib/loader", "lib/crabfs", "kernel"]
-resolver = "3"
-
-[workspace.package]
+[package]
+name = "rust-third-party"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[workspace.dependencies]
-loader = { path = "lib/loader" }
-crabfs = { path = "lib/crabfs" }
+[lib]
+name = "dummy"
+path = "dummy.rs"
 
+[dependencies]
 x86_64 = "0.15.4"
 limine = "0.5.0"
 uefi = { version = "0.31.0", features = ["alloc", "logger"] }
@@ -65,7 +63,7 @@ binrw = { version = "0.15.1", default-features = false }
 zlib-rs = { version = "0.6.3", default-features = false, features = [
     "__internal-api",
 ] }
-lz4_flex = { git = "https://github.com/yujincheng08/lz4_flex", branch = "hc", default-features = false, features = [
+lz4_flex = { git = "https://github.com/PSeitz/lz4_flex", branch = "hc_pr", default-features = false, features = [
     "checked-decode",
 ] }
 pic8259 = "0.11.0"

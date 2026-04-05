@@ -297,11 +297,7 @@ pub fn init_namespace() {
     let _ = create_named(&mut objects, "\\Device", ObjectData::Directory);
     let _ = create_named(&mut objects, "\\??", ObjectData::Directory);
     let _ = create_named(&mut objects, "\\KnownDlls", ObjectData::Directory);
-    let _ = create_named(
-        &mut objects,
-        "\\Device\\Crabfs0",
-        ObjectData::Directory,
-    );
+    let _ = create_named(&mut objects, "\\Device\\Crabfs0", ObjectData::Directory);
     let _ = create_named(
         &mut objects,
         "\\??\\C:",
@@ -318,7 +314,11 @@ pub fn init_namespace() {
     );
 }
 
-fn create_named(objects: &mut ObjectManager, name: &str, data: ObjectData) -> Result<u32, NtStatus> {
+fn create_named(
+    objects: &mut ObjectManager,
+    name: &str,
+    data: ObjectData,
+) -> Result<u32, NtStatus> {
     let canonical = canonicalize_nt_path(name);
     if objects.named.contains_key(&canonical) {
         return Err(STATUS_OBJECT_NAME_COLLISION);
@@ -368,7 +368,10 @@ fn object_type_of(data: &ObjectData) -> ObjectType {
 
 pub fn create_file(path: String, vfs_handle: i32) -> u32 {
     let mut objects = OBJECTS.lock();
-    insert_unnamed(&mut objects, ObjectData::File(FileObject { path, vfs_handle }))
+    insert_unnamed(
+        &mut objects,
+        ObjectData::File(FileObject { path, vfs_handle }),
+    )
 }
 
 pub fn create_event(manual_reset: bool, initial_state: bool) -> u32 {
@@ -467,7 +470,10 @@ pub fn with_section<T>(object_id: u32, f: impl FnOnce(&SectionObject) -> T) -> R
     }
 }
 
-pub fn with_event_mut<T>(object_id: u32, f: impl FnOnce(&mut EventObject) -> T) -> Result<T, NtStatus> {
+pub fn with_event_mut<T>(
+    object_id: u32,
+    f: impl FnOnce(&mut EventObject) -> T,
+) -> Result<T, NtStatus> {
     let mut objects = OBJECTS.lock();
     let Some(record) = objects.objects.get_mut(&object_id) else {
         return Err(STATUS_INVALID_HANDLE);

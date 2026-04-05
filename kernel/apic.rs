@@ -4,9 +4,9 @@ use crate::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::{
-    PhysAddr, VirtAddr,
     registers::model_specific::Msr,
     structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
 };
 
 pub const APIC_BASE_MSR: u32 = 0x1B;
@@ -103,6 +103,11 @@ pub fn current_lapic_id() -> Option<u32> {
 }
 
 fn mapped_base_for(physical_addr: u64) -> Result<u64, VmError> {
+    let hhdm_offset = HHDM_OFFSET.load(Ordering::SeqCst);
+    if hhdm_offset == 0 {
+        return Ok(physical_addr);
+    }
+
     if !allocator::runtime_ready() {
         return Err(VmError::RuntimeNotInitialized);
     }

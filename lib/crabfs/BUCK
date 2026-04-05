@@ -1,0 +1,24 @@
+rust_library(
+    name = "crabfs",
+    srcs = glob(["**/*.rs"]),
+    crate_root = "lib.rs",
+    crate = "crabfs",
+    edition = "2024",
+    visibility = ["PUBLIC"],
+    deps = [
+        "third-party//:thiserror",
+    ],
+)
+
+rust_library(
+    name = "crabfs_std",
+    srcs = glob(["**/*.rs"]),
+    crate_root = "lib.rs",
+    crate = "crabfs",
+    edition = "2024",
+    visibility = ["PUBLIC"],
+    features = ["std"],
+    deps = [
+        "third-party//:thiserror",
+    ],
+)

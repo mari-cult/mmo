@@ -160,7 +160,7 @@ fn stack_arg(frame: &SyscallFrame, index: usize) -> usize {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
+extern "sysv64" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
     if frame.is_null() {
         return nt::STATUS_INVALID_PARAMETER as usize;
     }
@@ -230,11 +230,10 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             frame.a3 as *mut usize,
             stack_arg(frame, 1) as u32,
         ) as usize,
-        nt::SYSCALL_NT_FREE_VIRTUAL_MEMORY => user::free_virtual_memory(
-            frame.a0,
-            frame.a1 as *mut usize,
-            frame.a2 as *mut usize,
-        ) as usize,
+        nt::SYSCALL_NT_FREE_VIRTUAL_MEMORY => {
+            user::free_virtual_memory(frame.a0, frame.a1 as *mut usize, frame.a2 as *mut usize)
+                as usize
+        }
         nt::SYSCALL_NT_PROTECT_VIRTUAL_MEMORY => user::protect_virtual_memory(
             frame.a0,
             frame.a1 as *mut usize,
@@ -242,16 +241,18 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             frame.a3 as u32,
             frame.a4 as *mut u32,
         ) as usize,
-        nt::SYSCALL_NT_CREATE_EVENT => user::create_event(
-            frame.a0 as *mut usize,
-            frame.a3 as u32,
-            frame.a4 != 0,
-        ) as usize,
+        nt::SYSCALL_NT_CREATE_EVENT => {
+            user::create_event(frame.a0 as *mut usize, frame.a3 as u32, frame.a4 != 0) as usize
+        }
         nt::SYSCALL_NT_SET_EVENT => user::set_event(frame.a0, frame.a1 as *mut i32) as usize,
         nt::SYSCALL_NT_WAIT_FOR_SINGLE_OBJECT => user::wait_for_single_object(frame.a0) as usize,
         nt::SYSCALL_NT_CREATE_USER_PROCESS => nt::STATUS_NOT_IMPLEMENTED as usize,
-        nt::SYSCALL_NT_TERMINATE_PROCESS => user::terminate_process(frame.a0, frame.a1 as i32) as usize,
-        nt::SYSCALL_NT_TERMINATE_THREAD => user::terminate_thread(frame.a0, frame.a1 as i32) as usize,
+        nt::SYSCALL_NT_TERMINATE_PROCESS => {
+            user::terminate_process(frame.a0, frame.a1 as i32) as usize
+        }
+        nt::SYSCALL_NT_TERMINATE_THREAD => {
+            user::terminate_thread(frame.a0, frame.a1 as i32) as usize
+        }
         _ => nt::STATUS_NOT_IMPLEMENTED as usize,
     }
 }

@@ -1,0 +1,12 @@
+rust_library(
+    name = "loader",
+    srcs = glob(["**/*.rs"]),
+    crate_root = "loader.rs",
+    crate = "loader",
+    edition = "2024",
+    visibility = ["PUBLIC"],
+    deps = [
+        "third-party//:goblin",
+        "third-party//:thiserror",
+    ],
+)

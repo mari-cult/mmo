@@ -28,12 +28,19 @@ pub mod zram;
 
 use core::{arch::asm, panic::PanicInfo};
 use limine::{
-    BaseRevision,
     request::{
         EntryPointRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
         StackSizeRequest,
     },
+    BaseRevision,
 };
+#[cfg(target_os = "uefi")]
+use uefi::proto::loaded_image::LoadedImage;
+#[cfg(target_os = "uefi")]
+use uefi::proto::media::block::BlockIO;
+use uefi::table::boot::SearchType;
+#[cfg(target_os = "uefi")]
+use uefi::Identify;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 const LIMINE_STACK_SIZE: u64 = 1024 * 1024;
@@ -85,7 +92,6 @@ fn efi_main(
     handle: uefi::Handle,
     system_table: uefi::table::SystemTable<uefi::table::Boot>,
 ) -> uefi::Status {
-    uefi::helpers::init().unwrap();
     println!("NT KERNEL: Booted via EFI STUB!");
 
     // Allocate a heap from UEFI
@@ -110,15 +116,81 @@ fn efi_main(
         heap_ptr as *const u8
     );
 
-    // Exit UEFI boot services
-    unsafe {
-        let _ = uefi::boot::exit_boot_services(uefi::table::boot::MemoryType::LOADER_DATA);
-    }
+    allocator::init_uefi_runtime(system_table.boot_services());
+    apic::set_hhdm_offset(x86_64::VirtAddr::new(0));
+    println!("NT KERNEL: runtime allocator initialized from UEFI boot services");
+
+    install_uefi_root_device(handle, &system_table);
 
     // Transition to the kernel
     println!("Transitioning to kernel..."); // This might not work if UEFI console is gone
 
     kernel_main()
+}
+
+#[cfg(target_os = "uefi")]
+fn install_uefi_root_device(
+    image_handle: uefi::Handle,
+    system_table: &uefi::table::SystemTable<uefi::table::Boot>,
+) {
+    let Ok(loaded_image) = system_table
+        .boot_services()
+        .open_protocol_exclusive::<LoadedImage>(image_handle)
+    else {
+        println!("NT KERNEL: failed to open LoadedImage protocol");
+        return;
+    };
+    let boot_device = loaded_image.device();
+    drop(loaded_image);
+
+    let Ok(handles) = system_table
+        .boot_services()
+        .locate_handle_buffer(SearchType::ByProtocol(&BlockIO::GUID))
+    else {
+        println!("NT KERNEL: no UEFI BlockIO handles found");
+        return;
+    };
+
+    let mut best: Option<(*mut BlockIO, u32, usize, usize, u64)> = None;
+    for handle in handles.iter().copied() {
+        if Some(handle) == boot_device {
+            continue;
+        }
+
+        let Ok(block_io) = system_table
+            .boot_services()
+            .open_protocol_exclusive::<BlockIO>(handle)
+        else {
+            continue;
+        };
+        let media = block_io.media();
+        if !media.is_media_present() || media.is_logical_partition() {
+            continue;
+        }
+
+        let block_size = media.block_size() as usize;
+        let io_align = media.io_align() as usize;
+        let media_id = media.media_id();
+        let last_block = media.last_block();
+        let ptr = (&*block_io as *const BlockIO).cast_mut();
+        core::mem::forget(block_io);
+        let replace = best
+            .as_ref()
+            .is_none_or(|(_, _, _, _, best_last_block)| last_block > *best_last_block);
+        if replace {
+            best = Some((ptr, media_id, block_size, io_align, last_block));
+        }
+    }
+
+    if let Some((ptr, media_id, block_size, io_align, last_block)) = best {
+        vfs::install_uefi_root_device(ptr, media_id, block_size, io_align);
+        println!(
+            "NT KERNEL: registered UEFI root block device block_size={} io_align={} last_lba={}",
+            block_size, io_align, last_block
+        );
+    } else {
+        println!("NT KERNEL: no non-boot UEFI BlockIO root device found");
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -127,6 +199,7 @@ pub extern "C" fn kernel_main() -> ! {
         asm!("cli");
     }
     println!("NT KERNEL: Initializing (CPU INTERRUPTS DISABLED)...");
+    let limine_hhdm = HHDM_REQUEST.get_response();
     if BASE_REVISION.is_valid() {
         println!(
             "NT KERNEL: Limine base revision loaded={}",
@@ -134,7 +207,7 @@ pub extern "C" fn kernel_main() -> ! {
         );
     }
     let mut reclaim_demo_base = None;
-    if let Some(hhdm) = HHDM_REQUEST.get_response() {
+    if let Some(hhdm) = limine_hhdm {
         let physical_memory_offset = x86_64::VirtAddr::new(hhdm.offset());
         apic::set_hhdm_offset(physical_memory_offset);
         let mut mapper = unsafe { paging::init(physical_memory_offset) };
@@ -147,9 +220,7 @@ pub extern "C" fn kernel_main() -> ! {
                 Some(reclaim::allocate_region(3).expect("failed to allocate reclaim demo region"));
         }
     } else {
-        println!(
-            "NT KERNEL: No Limine response. Continuing with UEFI stub initialization..."
-        );
+        println!("NT KERNEL: No Limine response. Continuing with UEFI stub initialization...");
     }
 
     println!("NT KERNEL: Heap initialized.");
@@ -182,11 +253,34 @@ pub extern "C" fn kernel_main() -> ! {
     println!("NT KERNEL: Syscalls initialized.");
 
     let mut init_task = None;
-    match (
-        cmdline::resolved_root_device(),
-        cmdline::resolved_root_fstype(),
-        virtio_blk::VirtioBlkDevice::probe(),
-    ) {
+    if limine_hhdm.is_none() {
+        match vfs::mount_uefi_root() {
+            Ok(()) => {
+                println!("NT KERNEL: mounted root via UEFI BlockIO");
+                let init_path = cmdline::resolved_init_path();
+                match user::create_init_task(3, &init_path) {
+                    Ok(task) => {
+                        println!("NT KERNEL: native init {} task prepared", init_path);
+                        init_task = Some(task);
+                    }
+                    Err(init_err) => {
+                        println!(
+                            "NT KERNEL: native init {} prepare failed: {:#x}",
+                            init_path, init_err
+                        );
+                    }
+                }
+            }
+            Err(mount_err) => {
+                println!("NT KERNEL: UEFI root mount failed: {:?}", mount_err);
+            }
+        }
+    } else {
+        match (
+            cmdline::resolved_root_device(),
+            cmdline::resolved_root_fstype(),
+            virtio_blk::VirtioBlkDevice::probe(),
+        ) {
         (Some(cmdline::RootDevice::VirtioBlk0), Some(cmdline::RootFsType::Crabfs), Ok(dev)) => {
             println!("NT KERNEL: PCI found modern virtio-blk");
             match vfs::mount_root(dev) {
@@ -217,8 +311,30 @@ pub extern "C" fn kernel_main() -> ! {
         (_, None, _) => {
             println!("NT KERNEL: unsupported rootfstype= parameter");
         }
-        (_, _, Err(_)) => {
-            println!("NT KERNEL: no modern virtio-blk device detected");
+        (_, _, Err(err)) => match vfs::mount_uefi_root() {
+            Ok(()) => {
+                println!("NT KERNEL: mounted root via UEFI BlockIO");
+                let init_path = cmdline::resolved_init_path();
+                match user::create_init_task(3, &init_path) {
+                    Ok(task) => {
+                        println!("NT KERNEL: native init {} task prepared", init_path);
+                        init_task = Some(task);
+                    }
+                    Err(init_err) => {
+                        println!(
+                            "NT KERNEL: native init {} prepare failed: {:#x}",
+                            init_path, init_err
+                        );
+                    }
+                }
+            }
+            Err(mount_err) => {
+                println!(
+                    "NT KERNEL: virtio-blk probe failed: {:?}, UEFI root mount failed: {:?}",
+                    err, mount_err
+                );
+            }
+        },
         }
     }
 

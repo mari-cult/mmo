@@ -2,21 +2,43 @@ extern crate alloc;
 
 use crate::paging;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::request::MemoryMapRequest;
 use spin::{Lazy, Mutex};
+#[cfg(target_os = "uefi")]
+use uefi::table::boot::{AllocateType, BootServices};
+use uefi::mem::memory_map::MemoryMap as _;
+use uefi::table::boot::MemoryType;
 use x86_64::structures::paging::{
+    mapper::{FlagUpdateError, MapToError, UnmapError},
     FrameAllocator, Mapper as _, OffsetPageTable, Page, PageSize, PageTableFlags, PhysFrame,
     Size4KiB,
-    mapper::{FlagUpdateError, MapToError, UnmapError},
 };
 use x86_64::{PhysAddr, VirtAddr};
 
+#[derive(Clone, Copy)]
+struct MemoryRegion {
+    base: u64,
+    length: u64,
+}
+
 pub struct BootInfoFrameAllocator {
-    memory_map: &'static [&'static limine::memory_map::Entry],
+    regions: Vec<MemoryRegion>,
     recycled: Vec<PhysFrame>,
     current_entry: usize,
     current_addr: u64,
+}
+
+pub enum RuntimeFrameAllocator {
+    BootInfo(BootInfoFrameAllocator),
+    #[cfg(target_os = "uefi")]
+    Uefi(UefiFrameAllocator),
+}
+
+#[cfg(target_os = "uefi")]
+pub struct UefiFrameAllocator {
+    boot_services_addr: usize,
+    recycled: Vec<PhysFrame>,
 }
 
 impl BootInfoFrameAllocator {
@@ -26,8 +48,38 @@ impl BootInfoFrameAllocator {
     }
 
     pub fn init_from_limine(response: &'static limine::response::MemoryMapResponse) -> Self {
+        let mut regions = Vec::new();
+        for entry in response.entries() {
+            let usable = unsafe {
+                core::mem::transmute::<limine::memory_map::EntryType, u64>(entry.entry_type) == 0
+            };
+            if usable {
+                regions.push(MemoryRegion {
+                    base: entry.base,
+                    length: entry.length,
+                });
+            }
+        }
+        Self::init_from_regions(regions)
+    }
+
+    pub fn init_from_uefi(memory_map: &uefi::mem::memory_map::MemoryMapOwned) -> Self {
+        let mut regions = Vec::new();
+        for entry in memory_map.entries() {
+            let usable = matches!(entry.ty, MemoryType::CONVENTIONAL);
+            if usable {
+                regions.push(MemoryRegion {
+                    base: entry.phys_start,
+                    length: entry.page_count * Size4KiB::SIZE,
+                });
+            }
+        }
+        Self::init_from_regions(regions)
+    }
+
+    fn init_from_regions(regions: Vec<MemoryRegion>) -> Self {
         BootInfoFrameAllocator {
-            memory_map: response.entries(),
+            regions,
             recycled: Vec::new(),
             current_entry: 0,
             current_addr: 0,
@@ -40,21 +92,15 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         if let Some(frame) = self.recycled.pop() {
             return Some(frame);
         }
-        while self.current_entry < self.memory_map.len() {
-            let entry = self.memory_map[self.current_entry];
-            let usable = unsafe {
-                core::mem::transmute::<limine::memory_map::EntryType, u64>(entry.entry_type) == 0
-            };
-            if !usable {
-                self.current_entry += 1;
-                self.current_addr = 0;
-                continue;
-            }
-
+        while self.current_entry < self.regions.len() {
+            let entry = self.regions[self.current_entry];
             let start = entry.base;
             let end = entry.base + entry.length;
             if self.current_addr < start {
                 self.current_addr = start;
+            }
+            if self.current_addr < Size4KiB::SIZE {
+                self.current_addr = Size4KiB::SIZE;
             }
             let addr = self.current_addr;
             if addr + 4096 <= end {
@@ -66,6 +112,34 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             self.current_addr = 0;
         }
         None
+    }
+}
+
+unsafe impl FrameAllocator<Size4KiB> for RuntimeFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        match self {
+            Self::BootInfo(allocator) => allocator.allocate_frame(),
+            #[cfg(target_os = "uefi")]
+            Self::Uefi(allocator) => allocator.allocate_frame(),
+        }
+    }
+}
+
+#[cfg(target_os = "uefi")]
+unsafe impl FrameAllocator<Size4KiB> for UefiFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        if let Some(frame) = self.recycled.pop() {
+            return Some(frame);
+        }
+
+        let boot_services = unsafe { (self.boot_services_addr as *mut BootServices).as_mut() }?;
+        let phys = boot_services
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .ok()?;
+        if phys < Size4KiB::SIZE {
+            return self.allocate_frame();
+        }
+        Some(PhysFrame::containing_address(PhysAddr::new(phys)))
     }
 }
 
@@ -116,16 +190,39 @@ use linked_list_allocator::LockedHeap;
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
-pub static FRAME_ALLOCATOR: Lazy<Mutex<Option<BootInfoFrameAllocator>>> =
+static RUNTIME_READY: AtomicBool = AtomicBool::new(false);
+pub static FRAME_ALLOCATOR: Lazy<Mutex<Option<RuntimeFrameAllocator>>> =
     Lazy::new(|| Mutex::new(None));
 
 pub fn init_runtime(physical_memory_offset: VirtAddr, frame_allocator: BootInfoFrameAllocator) {
+    init_runtime_with_allocator(
+        physical_memory_offset,
+        RuntimeFrameAllocator::BootInfo(frame_allocator),
+    );
+}
+
+pub fn init_runtime_with_allocator(
+    physical_memory_offset: VirtAddr,
+    frame_allocator: RuntimeFrameAllocator,
+) {
     PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
     *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
+    RUNTIME_READY.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "uefi")]
+pub fn init_uefi_runtime(boot_services: &BootServices) {
+    init_runtime_with_allocator(
+        VirtAddr::new(0),
+        RuntimeFrameAllocator::Uefi(UefiFrameAllocator {
+            boot_services_addr: boot_services as *const BootServices as usize,
+            recycled: Vec::new(),
+        }),
+    );
 }
 
 pub fn runtime_ready() -> bool {
-    PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst) != 0
+    RUNTIME_READY.load(Ordering::SeqCst)
 }
 
 pub fn allocate_and_map_page(
@@ -246,7 +343,11 @@ pub fn unmap_page_in(
 pub fn deallocate_frame(frame: PhysFrame<Size4KiB>) -> Result<(), VmError> {
     let mut guard = FRAME_ALLOCATOR.lock();
     let frame_allocator = guard.as_mut().ok_or(VmError::RuntimeNotInitialized)?;
-    frame_allocator.recycled.push(frame);
+    match frame_allocator {
+        RuntimeFrameAllocator::BootInfo(frame_allocator) => frame_allocator.recycled.push(frame),
+        #[cfg(target_os = "uefi")]
+        RuntimeFrameAllocator::Uefi(frame_allocator) => frame_allocator.recycled.push(frame),
+    }
     Ok(())
 }
 
@@ -261,16 +362,15 @@ pub fn zero_page(page: Page<Size4KiB>) {
 }
 
 pub fn physical_memory_offset() -> Result<VirtAddr, VmError> {
-    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst);
-    if offset == 0 {
+    if !runtime_ready() {
         Err(VmError::RuntimeNotInitialized)
     } else {
-        Ok(VirtAddr::new(offset))
+        Ok(VirtAddr::new(PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst)))
     }
 }
 
 fn with_runtime<T>(
-    f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
+    f: impl FnOnce(&mut OffsetPageTable, &mut RuntimeFrameAllocator) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let offset = physical_memory_offset()?;
     let (root_frame, _) = x86_64::registers::control::Cr3::read();
@@ -279,7 +379,7 @@ fn with_runtime<T>(
 
 fn with_runtime_in<T>(
     root_frame: PhysFrame<Size4KiB>,
-    f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
+    f: impl FnOnce(&mut OffsetPageTable, &mut RuntimeFrameAllocator) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let offset = physical_memory_offset()?;
     with_runtime_in_with_offset(root_frame, offset, f)
@@ -288,7 +388,7 @@ fn with_runtime_in<T>(
 fn with_runtime_in_with_offset<T>(
     root_frame: PhysFrame<Size4KiB>,
     offset: VirtAddr,
-    f: impl FnOnce(&mut OffsetPageTable, &mut BootInfoFrameAllocator) -> Result<T, VmError>,
+    f: impl FnOnce(&mut OffsetPageTable, &mut RuntimeFrameAllocator) -> Result<T, VmError>,
 ) -> Result<T, VmError> {
     let mut guard = FRAME_ALLOCATOR.lock();
     let frame_allocator = guard.as_mut().ok_or(VmError::RuntimeNotInitialized)?;

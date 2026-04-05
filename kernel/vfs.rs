@@ -1,11 +1,15 @@
 extern crate alloc;
 
 use crate::print;
+use crate::println;
 use crate::serial;
 use crate::virtio_blk::VirtioBlkDevice;
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use crabfs::device::BlockDevice;
+use crabfs::error::DeviceError;
 use crabfs::on_disk::superblock::Superblock;
 use crabfs::reader;
 use spin::{Lazy, Mutex};
@@ -65,8 +69,184 @@ struct Pipe {
     writers: usize,
 }
 
+enum RootDevice {
+    Virtio(VirtioBlkDevice),
+    Uefi(UefiBlockDevice),
+}
+
+impl BlockDevice for RootDevice {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
+        match self {
+            Self::Virtio(dev) => dev.read_at(offset, buf),
+            Self::Uefi(dev) => dev.read_at(offset, buf),
+        }
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
+        match self {
+            Self::Virtio(dev) => dev.write_at(offset, buf),
+            Self::Uefi(dev) => dev.write_at(offset, buf),
+        }
+    }
+}
+
+struct UefiBlockDevice {
+    block_io: *mut uefi::proto::media::block::BlockIO,
+    media_id: u32,
+    block_size: usize,
+    io_align: usize,
+}
+
+unsafe impl Send for UefiBlockDevice {}
+
+impl UefiBlockDevice {
+    unsafe fn block_io(&self) -> &uefi::proto::media::block::BlockIO {
+        unsafe { &*self.block_io }
+    }
+
+    unsafe fn block_io_mut(&mut self) -> &mut uefi::proto::media::block::BlockIO {
+        unsafe { &mut *self.block_io }
+    }
+
+    fn scratch_buffer(&self, len: usize) -> Result<AlignedBuffer, DeviceError> {
+        let align = self.io_align.max(core::mem::align_of::<usize>());
+        AlignedBuffer::new(len, align).ok_or(DeviceError::Io)
+    }
+}
+
+impl BlockDevice for UefiBlockDevice {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let block_size = self.block_size as u64;
+        let start_lba = offset / block_size;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(DeviceError::Io)?;
+        let end_lba = end.div_ceil(block_size);
+        let block_count = usize::try_from(end_lba - start_lba).map_err(|_| DeviceError::Io)?;
+        let mut scratch = self.scratch_buffer(block_count * self.block_size)?;
+        let read_result = unsafe {
+            self.block_io()
+                .read_blocks(self.media_id, start_lba, scratch.as_mut_slice())
+        };
+        if let Err(err) = read_result {
+            println!(
+                "NT KERNEL: UEFI BlockIO read failed media_id={} lba={} len={} status={:?}",
+                self.media_id,
+                start_lba,
+                scratch.as_mut_slice().len(),
+                err.status()
+            );
+            return Err(DeviceError::Io);
+        }
+        if offset == 0 {
+            let header = &scratch.as_slice()[..8.min(scratch.as_slice().len())];
+            println!(
+                "NT KERNEL: UEFI BlockIO sector0 {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                header.first().copied().unwrap_or(0),
+                header.get(1).copied().unwrap_or(0),
+                header.get(2).copied().unwrap_or(0),
+                header.get(3).copied().unwrap_or(0),
+                header.get(4).copied().unwrap_or(0),
+                header.get(5).copied().unwrap_or(0),
+                header.get(6).copied().unwrap_or(0),
+                header.get(7).copied().unwrap_or(0),
+            );
+        }
+
+        let start = usize::try_from(offset % block_size).map_err(|_| DeviceError::Io)?;
+        buf.copy_from_slice(&scratch.as_slice()[start..start + buf.len()]);
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), DeviceError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let block_size = self.block_size as u64;
+        let start_lba = offset / block_size;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(DeviceError::Io)?;
+        let end_lba = end.div_ceil(block_size);
+        let block_count = usize::try_from(end_lba - start_lba).map_err(|_| DeviceError::Io)?;
+        let mut scratch = self.scratch_buffer(block_count * self.block_size)?;
+        let start = usize::try_from(offset % block_size).map_err(|_| DeviceError::Io)?;
+        let media_id = self.media_id;
+
+        let read_result = unsafe {
+            self.block_io()
+                .read_blocks(self.media_id, start_lba, scratch.as_mut_slice())
+        };
+        if let Err(err) = read_result {
+            println!(
+                "NT KERNEL: UEFI BlockIO read-before-write failed media_id={} lba={} len={} status={:?}",
+                self.media_id,
+                start_lba,
+                scratch.as_mut_slice().len(),
+                err.status()
+            );
+            return Err(DeviceError::Io);
+        }
+        scratch.as_mut_slice()[start..start + buf.len()].copy_from_slice(buf);
+        let write_result = unsafe {
+            self.block_io_mut()
+                .write_blocks(media_id, start_lba, scratch.as_slice())
+        };
+        if let Err(err) = write_result {
+            println!(
+                "NT KERNEL: UEFI BlockIO write failed media_id={} lba={} len={} status={:?}",
+                media_id,
+                start_lba,
+                scratch.as_slice().len(),
+                err.status()
+            );
+            return Err(DeviceError::Io);
+        }
+        Ok(())
+    }
+}
+
+struct AlignedBuffer {
+    ptr: *mut u8,
+    len: usize,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, align: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(len.max(1), align).ok()?;
+        let ptr = unsafe { alloc_zeroed(layout) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, len, layout })
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
 pub struct Vfs {
-    dev: VirtioBlkDevice,
+    dev: RootDevice,
     sb: Superblock,
     files: Vec<Option<OpenFile>>,
     pipes: BTreeMap<u32, Pipe>,
@@ -76,7 +256,7 @@ pub struct Vfs {
 }
 
 impl Vfs {
-    fn mount(dev: VirtioBlkDevice) -> Result<Self, VfsError> {
+    fn mount(dev: RootDevice) -> Result<Self, VfsError> {
         let mut d = dev;
         let sb = reader::read_superblock(&mut d).map_err(|_| VfsError::Io)?;
         let mut files: Vec<Option<OpenFile>> = (0..FILE_MAX_SLOTS).map(|_| None).collect();
@@ -698,9 +878,30 @@ impl Vfs {
 }
 
 pub static VFS: Lazy<Mutex<Option<Vfs>>> = Lazy::new(|| Mutex::new(None));
+static UEFI_ROOT_DEVICE: Lazy<Mutex<Option<UefiBlockDevice>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn mount_root(dev: VirtioBlkDevice) -> Result<(), VfsError> {
-    *VFS.lock() = Some(Vfs::mount(dev)?);
+    *VFS.lock() = Some(Vfs::mount(RootDevice::Virtio(dev))?);
+    Ok(())
+}
+
+pub fn install_uefi_root_device(
+    block_io: *mut uefi::proto::media::block::BlockIO,
+    media_id: u32,
+    block_size: usize,
+    io_align: usize,
+) {
+    *UEFI_ROOT_DEVICE.lock() = Some(UefiBlockDevice {
+        block_io,
+        media_id,
+        block_size,
+        io_align,
+    });
+}
+
+pub fn mount_uefi_root() -> Result<(), VfsError> {
+    let dev = UEFI_ROOT_DEVICE.lock().take().ok_or(VfsError::NotMounted)?;
+    *VFS.lock() = Some(Vfs::mount(RootDevice::Uefi(dev))?);
     Ok(())
 }
 

@@ -50,8 +50,11 @@ set -g KERNEL_BIN "target/$TARGET/debug/kernel"
 set -g ROOTFS_IMG "rootfs.img"
 set -g NATIVE_INIT_DIR "userspace/native_init"
 set -g NATIVE_INIT_OBJ "native_init.obj"
-set -g NATIVE_INIT_STUBS "native_init_stubs.obj"
 set -g NATIVE_INIT_EXE "init.exe"
+set -g NTDLL_STUBS_OBJ "ntdll_stubs.obj"
+set -g NTDLL_RELOC_OBJ "ntdll_reloc.obj"
+set -g NTDLL_DLL "ntdll.dll"
+set -g NTDLL_LIB "ntdll.lib"
 set -q GENTOO_STAGE3_TARBALL; or set GENTOO_STAGE3_TARBALL ""
 set -q GENTOO_STAGE3_STAGING; or set GENTOO_STAGE3_STAGING "stage3-root"
 set -q KERNEL_INIT; or set KERNEL_INIT ""
@@ -90,18 +93,23 @@ function build_rootfs_from_dir
 end
 
 function build_native_init
-    echo "Building native PE32+ init.exe..."
+    echo "Building native PE32+ ntdll.dll and init.exe..."
     clang --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -fno-builtin \
         -c "$NATIVE_INIT_DIR/init.c" -o "$NATIVE_INIT_OBJ"
-    clang --target=x86_64-pc-windows-msvc -c "$NATIVE_INIT_DIR/syscall_stubs.S" -o "$NATIVE_INIT_STUBS"
+    clang --target=x86_64-pc-windows-msvc -c "$NATIVE_INIT_DIR/ntdll_stubs.S" -o "$NTDLL_STUBS_OBJ"
+    clang --target=x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -fno-builtin \
+        -c "$NATIVE_INIT_DIR/ntdll_reloc.c" -o "$NTDLL_RELOC_OBJ"
+    lld-link /dll /noentry /nodefaultlib /machine:x64 \
+        /base:0x140000000 /def:"$NATIVE_INIT_DIR/ntdll.def" /out:"$NTDLL_DLL" /implib:"$NTDLL_LIB" "$NTDLL_STUBS_OBJ" "$NTDLL_RELOC_OBJ"
     lld-link /entry:start /subsystem:native /nodefaultlib /machine:x64 \
-        /out:"$NATIVE_INIT_EXE" "$NATIVE_INIT_OBJ" "$NATIVE_INIT_STUBS"
+        /out:"$NATIVE_INIT_EXE" "$NATIVE_INIT_OBJ" "$NTDLL_LIB"
 end
 
 function install_native_init_to_dir
     set -l target_dir $argv[1]
     mkdir -p "$target_dir/Windows/System32"
     cp "$NATIVE_INIT_EXE" "$target_dir/Windows/System32/init.exe"
+    cp "$NTDLL_DLL" "$target_dir/Windows/System32/ntdll.dll"
 end
 
 function rootfs_has_crabfs_superblock

@@ -1,0 +1,22 @@
+LIBRARY ntdll.dll
+EXPORTS
+    NtClose
+    NtQueryInformationProcess
+    NtQueryInformationFile
+    NtReadFile
+    NtWriteFile
+    NtCreateFile
+    NtOpenFile
+    NtCreateSection
+    NtMapViewOfSection
+    NtUnmapViewOfSection
+    NtAllocateVirtualMemory
+    NtFreeVirtualMemory
+    NtProtectVirtualMemory
+    NtCreateEvent
+    NtSetEvent
+    NtWaitForSingleObject
+    NtCreateUserProcess
+    NtTerminateProcess
+    NtTerminateThread
+    NtdllRelocAnchorData DATA

@@ -1,4 +1,7 @@
+extern crate alloc;
+
 use crate::allocator;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::{Page, PageSize, PageTableFlags, PhysFrame, Size4KiB};
@@ -127,6 +130,54 @@ pub fn scan_bus0() -> [Option<PciDevice>; 32] {
         }
     }
     out
+}
+
+pub fn scan_devices() -> Vec<PciDevice> {
+    let mut devices = Vec::new();
+    for bus in 0u16..=255 {
+        for slot in 0u8..32 {
+            let addr0 = PciAddress {
+                bus: bus as u8,
+                slot,
+                function: 0,
+            };
+            let vendor = read_config_word(addr0, 0x00);
+            if vendor == 0xffff {
+                continue;
+            }
+
+            let header_type = read_config_byte(addr0, 0x0e);
+            let function_count = if (header_type & 0x80) != 0 { 8 } else { 1 };
+            for function in 0u8..function_count {
+                let addr = PciAddress {
+                    bus: bus as u8,
+                    slot,
+                    function,
+                };
+                let vendor_id = read_config_word(addr, 0x00);
+                if vendor_id == 0xffff {
+                    continue;
+                }
+
+                let device_id = read_config_word(addr, 0x02);
+                let class_code = read_config_byte(addr, 0x0b);
+                let subclass = read_config_byte(addr, 0x0a);
+                let prog_if = read_config_byte(addr, 0x09);
+                let bars = parse_bars(addr);
+
+                devices.push(PciDevice {
+                    address: addr,
+                    vendor_id,
+                    device_id,
+                    class_code,
+                    subclass,
+                    prog_if,
+                    bars,
+                });
+            }
+        }
+    }
+    devices
 }
 
 fn parse_bars(addr: PciAddress) -> [Option<PciBar>; 6] {

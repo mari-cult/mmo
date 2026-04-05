@@ -4,11 +4,11 @@ use crate::allocator;
 use crate::pci::{self, PciAddress, PciDevice};
 use core::mem::size_of;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use crabfs::device::BlockDevice;
 use crabfs::error::DeviceError;
-use x86_64::VirtAddr;
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
+use x86_64::VirtAddr;
 
 const VIRTIO_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_DEVICE_ID_BLOCK_MODERN: u16 = 0x1042;
@@ -207,9 +207,9 @@ unsafe impl Send for VirtioBlkDevice {}
 
 impl VirtioBlkDevice {
     pub fn probe() -> Result<Self, VirtioBlkError> {
-        let devices = pci::scan_bus0();
+        let devices = pci::scan_devices();
         let mut blk_dev: Option<PciDevice> = None;
-        for dev in devices.into_iter().flatten() {
+        for dev in devices {
             if dev.vendor_id == VIRTIO_VENDOR_ID
                 && (dev.device_id == VIRTIO_DEVICE_ID_BLOCK_MODERN
                     || dev.device_id == VIRTIO_DEVICE_ID_BLOCK_TRANSITIONAL)

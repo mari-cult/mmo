@@ -10,3 +10,10 @@ target/
 /stage3-root
 *.exe
 *.obj
+*.exe
+*.dll
+*.efi
+*.lib
+*.pdb
+/buck-out
+.codex

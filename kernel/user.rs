@@ -4,14 +4,15 @@ use crate::nt::{
     self, AccessMask, ClientId, FilePositionInformation, FileStandardInformation, Handle,
     IoStatusBlock, NtStatus, ObjectAttributes, Peb, ProcessBasicInformation,
     RtlUserProcessParameters, Teb, UnicodeString, STATUS_ACCESS_DENIED, STATUS_BUFFER_TOO_SMALL,
-    STATUS_END_OF_FILE, STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE,
-    STATUS_INVALID_IMAGE_FORMAT, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
-    STATUS_NOT_SUPPORTED, STATUS_NO_MEMORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS,
-    STATUS_UNSUCCESSFUL,
+    STATUS_CONFLICTING_ADDRESSES, STATUS_END_OF_FILE, STATUS_INFO_LENGTH_MISMATCH,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_IMAGE_FORMAT, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, STATUS_NO_MEMORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use crate::vfs;
-use crate::{allocator, gdt, kdebug, process, smp::MAX_CPUS};
+use crate::{allocator, gdt, kdebug, println, process, smp::MAX_CPUS};
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use goblin::pe::PE;
@@ -26,13 +27,31 @@ const USER_STACK_TOP: u64 = 0x0000_7fff_ff00_0000;
 const USER_STACK_PAGES: u64 = 64;
 const USER_ENV_BASE: u64 = 0x0000_7fff_f000_0000;
 const USER_ENV_PAGES: u64 = 16;
-const USER_ALLOC_BASE: u64 = 0x0000_0001_0000_0000;
+const USER_ALLOC_BASE: u64 = 0x0000_1000_0000_0000;
 const KERNEL_VIRTIO_DMA_BASE: u64 = 0x0000_6666_0000_0000;
 
 #[derive(Debug, Clone, Copy)]
 struct HandleEntry {
     object_id: u32,
     access: AccessMask,
+}
+
+#[derive(Debug, Clone)]
+enum ExportTarget {
+    Address(u64),
+    ForwardName { dll_path: String, symbol: String },
+    ForwardOrdinal { dll_path: String, ordinal: usize },
+}
+
+#[derive(Debug, Clone)]
+struct LoadedModule {
+    nt_path: String,
+    dll_name: String,
+    image_base: u64,
+    entry: u64,
+    size_of_image: u64,
+    exports_by_name: BTreeMap<String, ExportTarget>,
+    exports_by_ordinal: BTreeMap<usize, ExportTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +72,7 @@ pub struct UserProcess {
     standard_error: Handle,
     process_object: u32,
     thread_object: u32,
+    modules: Vec<LoadedModule>,
     exited: bool,
     exit_status: NtStatus,
 }
@@ -76,6 +96,7 @@ impl Default for UserProcess {
             standard_error: 0,
             process_object: 0,
             thread_object: 0,
+            modules: Vec::new(),
             exited: false,
             exit_status: 0,
         }
@@ -117,11 +138,14 @@ struct UserRegistry {
     task_to_pid: BTreeMap<usize, u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LoadedImage {
     entry: u64,
     image_base: u64,
     size_of_image: u64,
+    exports_by_name: BTreeMap<String, ExportTarget>,
+    exports_by_ordinal: BTreeMap<usize, ExportTarget>,
+    dll_name: String,
 }
 
 static CURRENTS: Lazy<[Mutex<UserProcess>; MAX_CPUS]> =
@@ -187,6 +211,31 @@ fn with_current_address_space<T>(f: impl FnOnce(&mut AddressSpace) -> T) -> T {
     f(space)
 }
 
+fn with_current_process<T>(f: impl FnOnce(&mut UserProcess) -> T) -> T {
+    f(&mut current_slot().lock())
+}
+
+fn region_is_free(start: u64, len: u64) -> bool {
+    let start = align_down(start, PAGE_SIZE);
+    let end = align_up(start.saturating_add(len), PAGE_SIZE);
+    let mappings =
+        with_current_address_space(|space| space.mappings.keys().copied().collect::<Vec<u64>>());
+    !mappings.into_iter().any(|virt| virt >= start && virt < end)
+}
+
+fn pml4_index(addr: u64) -> usize {
+    ((addr >> 39) & 0x1ff) as usize
+}
+
+fn map_region_exact(start: u64, len: u64, prot: u32) -> Result<(), NtStatus> {
+    let start = align_down(start, PAGE_SIZE);
+    let len = align_up(len, PAGE_SIZE);
+    if !region_is_free(start, len) {
+        return Err(STATUS_CONFLICTING_ADDRESSES);
+    }
+    map_region(start, len, prot)
+}
+
 fn address_space_mappings(asid: u32) -> Vec<UserMapping> {
     let registry = REGISTRY.lock();
     registry
@@ -210,6 +259,12 @@ fn create_address_space() -> Result<AddressSpace, NtStatus> {
     let new_ptr = (offset.as_u64() + root_frame.start_address().as_u64()) as *mut PageTable;
     let (current_root, _) = Cr3::read();
     let current_ptr = (offset.as_u64() + current_root.start_address().as_u64()) as *const PageTable;
+    println!(
+        "NT KERNEL: create_address_space root_frame={:#x} current_root={:#x} offset={:#x}",
+        root_frame.start_address().as_u64(),
+        current_root.start_address().as_u64(),
+        offset.as_u64()
+    );
 
     unsafe {
         let new_table = &mut *new_ptr;
@@ -422,7 +477,9 @@ fn seed_standard_handles(current: &mut UserProcess) -> Result<(), NtStatus> {
         let vfs_handle = vfs::open(path, 0).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
         let object_id = nt::create_file(path.to_string(), vfs_handle);
         nt::retain(object_id)?;
-        current.handles.push(Some(HandleEntry { object_id, access }));
+        current
+            .handles
+            .push(Some(HandleEntry { object_id, access }));
         let handle = slot_to_handle(current.handles.len() - 1);
         match out {
             0 => current.standard_input = handle,
@@ -776,7 +833,8 @@ pub fn query_information_file(
             if length < core::mem::size_of::<FileStandardInformation>() as u32 {
                 STATUS_INFO_LENGTH_MISMATCH
             } else {
-                let stat = match nt::with_file(entry.object_id, |file| vfs::fstat(file.vfs_handle)) {
+                let stat = match nt::with_file(entry.object_id, |file| vfs::fstat(file.vfs_handle))
+                {
                     Ok(Ok(stat)) => stat,
                     Ok(Err(_)) => return STATUS_UNSUCCESSFUL,
                     Err(status) => return status,
@@ -798,7 +856,9 @@ pub fn query_information_file(
             if length < core::mem::size_of::<FilePositionInformation>() as u32 {
                 STATUS_INFO_LENGTH_MISMATCH
             } else {
-                let offset = match nt::with_file(entry.object_id, |file| vfs::lseek(file.vfs_handle, 0, 1)) {
+                let offset = match nt::with_file(entry.object_id, |file| {
+                    vfs::lseek(file.vfs_handle, 0, 1)
+                }) {
                     Ok(Ok(offset)) => offset,
                     Ok(Err(_)) => return STATUS_UNSUCCESSFUL,
                     Err(status) => return status,
@@ -851,7 +911,10 @@ pub fn create_event(out_handle: *mut Handle, event_type: u32, initial_state: boo
     }
     let manual_reset = event_type == nt::EVENT_TYPE_NOTIFICATION;
     let object_id = nt::create_event(manual_reset, initial_state);
-    let handle = match install_handle(object_id, nt::EVENT_QUERY_STATE | nt::EVENT_MODIFY_STATE | nt::SYNCHRONIZE) {
+    let handle = match install_handle(
+        object_id,
+        nt::EVENT_QUERY_STATE | nt::EVENT_MODIFY_STATE | nt::SYNCHRONIZE,
+    ) {
         Ok(handle) => handle,
         Err(status) => {
             let _ = nt::release(object_id);
@@ -1012,12 +1075,10 @@ pub fn query_information_process(
     }
     let _ = match resolve_handle_entry(process_handle) {
         Ok(entry) => entry,
-        Err(status) if process_handle == usize::MAX => {
-            HandleEntry {
-                object_id: current_slot().lock().process_object,
-                access: nt::PROCESS_ALL_ACCESS,
-            }
-        }
+        Err(_status) if process_handle == usize::MAX => HandleEntry {
+            object_id: current_slot().lock().process_object,
+            access: nt::PROCESS_ALL_ACCESS,
+        },
         Err(status) => return status,
     };
     match info_class {
@@ -1101,13 +1162,25 @@ pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, NtS
     }
     {
         let mut registry = REGISTRY.lock();
-        let space = create_address_space()?;
+        let space = match create_address_space() {
+            Ok(space) => space,
+            Err(status) => {
+                println!("NT KERNEL: create_address_space failed: {:#x}", status);
+                return Err(status);
+            }
+        };
         registry.spaces.insert(1, space);
         registry.by_pid.insert(pid, current_slot().lock().clone());
         registry.task_to_pid.insert(task_id, pid);
     }
     switch_active_process(Some(pid));
-    let ctx = load_init_context(task_id, pid, path)?;
+    let ctx = match load_init_context(task_id, pid, path) {
+        Ok(ctx) => ctx,
+        Err(status) => {
+            println!("NT KERNEL: load_init_context failed: {:#x}", status);
+            return Err(status);
+        }
+    };
     REGISTRY
         .lock()
         .by_pid
@@ -1123,20 +1196,41 @@ pub fn create_init_task(task_id: usize, path: &str) -> Result<process::Task, NtS
     ))
 }
 
-fn load_init_context(task_id: usize, pid: u32, nt_path: &str) -> Result<process::SavedTaskContext, NtStatus> {
-    let vfs_path = nt::resolve_nt_path(nt_path)?;
-    let bytes = vfs::read_all(&vfs_path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
-    let image = load_pe_image(&bytes)?;
+fn load_init_context(
+    task_id: usize,
+    pid: u32,
+    nt_path: &str,
+) -> Result<process::SavedTaskContext, NtStatus> {
+    let image = match load_module(nt_path) {
+        Ok(image) => image,
+        Err(status) => {
+            println!("NT KERNEL: load_module({}) failed: {:#x}", nt_path, status);
+            return Err(status);
+        }
+    };
 
     let stack_bottom = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
-    map_region(stack_bottom, USER_STACK_PAGES * PAGE_SIZE, nt::PAGE_READWRITE)?;
+    if let Err(status) = map_region(
+        stack_bottom,
+        USER_STACK_PAGES * PAGE_SIZE,
+        nt::PAGE_READWRITE,
+    ) {
+        println!("NT KERNEL: user stack map failed: {:#x}", status);
+        return Err(status);
+    }
     let stack_top = USER_STACK_TOP;
 
     {
         let mut current = current_slot().lock();
         current.image_base = image.image_base;
     }
-    let (peb_addr, teb_addr, params_addr) = build_process_environment(nt_path, stack_top)?;
+    let (peb_addr, teb_addr, params_addr) = match build_process_environment(nt_path, stack_top) {
+        Ok(values) => values,
+        Err(status) => {
+            println!("NT KERNEL: build_process_environment failed: {:#x}", status);
+            return Err(status);
+        }
+    };
     {
         let mut current = current_slot().lock();
         current.pid = pid;
@@ -1159,7 +1253,43 @@ fn load_init_context(task_id: usize, pid: u32, nt_path: &str) -> Result<process:
     })
 }
 
-fn load_pe_image(bytes: &[u8]) -> Result<LoadedImage, NtStatus> {
+fn load_module(nt_path: &str) -> Result<LoadedImage, NtStatus> {
+    let canonical_path = canonical_module_path(nt_path);
+    if let Some(existing) = with_current_process(|current| {
+        current
+            .modules
+            .iter()
+            .find(|module| module.nt_path.eq_ignore_ascii_case(&canonical_path))
+            .cloned()
+    }) {
+        return Ok(LoadedImage {
+            entry: existing.entry,
+            image_base: existing.image_base,
+            size_of_image: existing.size_of_image,
+            exports_by_name: existing.exports_by_name,
+            exports_by_ordinal: existing.exports_by_ordinal,
+            dll_name: existing.dll_name,
+        });
+    }
+
+    let vfs_path = nt::resolve_nt_path(&canonical_path)?;
+    let bytes = vfs::read_all(&vfs_path).map_err(|_| STATUS_OBJECT_NAME_NOT_FOUND)?;
+    let image = load_pe_image(&canonical_path, &bytes)?;
+    with_current_process(|current| {
+        current.modules.push(LoadedModule {
+            nt_path: canonical_path,
+            dll_name: image.dll_name.clone(),
+            image_base: image.image_base,
+            entry: image.entry,
+            size_of_image: image.size_of_image,
+            exports_by_name: image.exports_by_name.clone(),
+            exports_by_ordinal: image.exports_by_ordinal.clone(),
+        });
+    });
+    Ok(image)
+}
+
+fn load_pe_image(nt_path: &str, bytes: &[u8]) -> Result<LoadedImage, NtStatus> {
     let pe = PE::parse(bytes).map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
     if !pe.is_64 {
         return Err(STATUS_INVALID_IMAGE_FORMAT);
@@ -1167,14 +1297,50 @@ fn load_pe_image(bytes: &[u8]) -> Result<LoadedImage, NtStatus> {
     if pe.header.coff_header.machine != goblin::pe::header::COFF_MACHINE_X86_64 {
         return Err(nt::STATUS_IMAGE_MACHINE_TYPE_MISMATCH);
     }
-    if !pe.libraries.is_empty() {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-    let optional = pe.header.optional_header.ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
-    let image_base = pe.image_base;
+    let optional = pe
+        .header
+        .optional_header
+        .ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+    let preferred_base = pe.image_base;
     let size_of_image = optional.windows_fields.size_of_image as u64;
     let size_of_headers = optional.windows_fields.size_of_headers as usize;
-    map_region(image_base, align_up(size_of_image, PAGE_SIZE), nt::PAGE_READWRITE)?;
+    let image_base = if pml4_index(preferred_base) == 0 {
+        let has_relocs = pe.relocation_data.is_some();
+        if !has_relocs {
+            return Err(STATUS_CONFLICTING_ADDRESSES);
+        }
+        match allocate_user_region(size_of_image, nt::PAGE_READWRITE) {
+            Ok(base) => base,
+            Err(status) => {
+                println!(
+                    "NT KERNEL: allocate_user_region image {} size={:#x} failed: {:#x}",
+                    nt_path, size_of_image, status
+                );
+                return Err(status);
+            }
+        }
+    } else {
+        match map_region_exact(preferred_base, size_of_image, nt::PAGE_READWRITE) {
+            Ok(()) => preferred_base,
+            Err(STATUS_CONFLICTING_ADDRESSES) => {
+                let has_relocs = pe.relocation_data.is_some();
+                if !has_relocs {
+                    return Err(STATUS_CONFLICTING_ADDRESSES);
+                }
+                match allocate_user_region(size_of_image, nt::PAGE_READWRITE) {
+                    Ok(base) => base,
+                    Err(status) => {
+                        println!(
+                            "NT KERNEL: allocate_user_region image {} size={:#x} failed: {:#x}",
+                            nt_path, size_of_image, status
+                        );
+                        return Err(status);
+                    }
+                }
+            }
+            Err(status) => return Err(status),
+        }
+    };
     unsafe {
         core::ptr::write_bytes(image_base as *mut u8, 0, size_of_image as usize);
         core::ptr::copy_nonoverlapping(
@@ -1207,23 +1373,213 @@ fn load_pe_image(bytes: &[u8]) -> Result<LoadedImage, NtStatus> {
                 );
             }
         }
+    }
+    apply_base_relocations(&pe, image_base)?;
+    let (exports_by_name, exports_by_ordinal) = collect_exports(&pe, image_base);
+    resolve_imports(&pe, image_base)?;
+    for section in &pe.sections {
+        let virt = image_base + section.virtual_address as u64;
+        let virtual_size = (section.virtual_size.max(section.size_of_raw_data)) as usize;
         let prot = section_to_protection(section.characteristics);
         protect_region(virt, align_up(virtual_size as u64, PAGE_SIZE), prot)?;
     }
     let headers_protect = nt::PAGE_READONLY;
-    protect_region(image_base, align_up(size_of_headers as u64, PAGE_SIZE), headers_protect)?;
+    protect_region(
+        image_base,
+        align_up(size_of_headers as u64, PAGE_SIZE),
+        headers_protect,
+    )?;
     let entry = image_base + pe.entry as u64;
     kdebug!(
-        "USER-PE path image_base={:#x} size={:#x} entry={:#x}",
+        "USER-PE path={} image_base={:#x} preferred={:#x} size={:#x} entry={:#x} imports={}",
+        nt_path,
         image_base,
+        preferred_base,
         size_of_image,
-        entry
+        entry,
+        pe.imports.len()
     );
     Ok(LoadedImage {
         entry,
         image_base,
         size_of_image,
+        exports_by_name,
+        exports_by_ordinal,
+        dll_name: pe
+            .name
+            .unwrap_or(module_basename(nt_path))
+            .to_ascii_lowercase(),
     })
+}
+
+fn apply_base_relocations(pe: &PE<'_>, image_base: u64) -> Result<(), NtStatus> {
+    let delta = image_base.wrapping_sub(pe.image_base);
+    if delta == 0 {
+        return Ok(());
+    }
+    let Some(relocation_data) = pe.relocation_data.as_ref() else {
+        return Err(STATUS_CONFLICTING_ADDRESSES);
+    };
+    for block in relocation_data.blocks() {
+        let block = block.map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+        for word in block.words() {
+            let word = word.map_err(|_| STATUS_INVALID_IMAGE_FORMAT)?;
+            let reloc_type = word.reloc_type();
+            let target = image_base + block.rva as u64 + u64::from(word.offset());
+            match reloc_type {
+                x if x == goblin::pe::relocation::IMAGE_REL_BASED_ABSOLUTE as u8 => {}
+                x if x == goblin::pe::relocation::IMAGE_REL_BASED_DIR64 as u8 => unsafe {
+                    let ptr = target as *mut u64;
+                    *ptr = (*ptr).wrapping_add(delta);
+                },
+                x if x == goblin::pe::relocation::IMAGE_REL_BASED_HIGHLOW as u8 => unsafe {
+                    let ptr = target as *mut u32;
+                    *ptr = (*ptr).wrapping_add(delta as u32);
+                },
+                _ => return Err(STATUS_NOT_SUPPORTED),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_exports(
+    pe: &PE<'_>,
+    image_base: u64,
+) -> (
+    BTreeMap<String, ExportTarget>,
+    BTreeMap<usize, ExportTarget>,
+) {
+    let mut exports_by_name = BTreeMap::new();
+    let mut exports_by_ordinal = BTreeMap::new();
+
+    if let Some(export_data) = pe.export_data.as_ref() {
+        let ordinal_base = export_data.export_directory_table.ordinal_base as usize;
+        for (index, entry) in export_data.export_address_table.iter().enumerate() {
+            let ordinal = ordinal_base + index;
+            let target = match entry {
+                goblin::pe::export::ExportAddressTableEntry::ExportRVA(rva) => {
+                    ExportTarget::Address(image_base + u64::from(*rva))
+                }
+                goblin::pe::export::ExportAddressTableEntry::ForwarderRVA(_) => {
+                    let reexport = pe
+                        .exports
+                        .iter()
+                        .find(|export| export.reexport.is_some() && export.rva == entry_rva(entry))
+                        .and_then(|export| export.reexport.as_ref());
+                    match reexport {
+                        Some(goblin::pe::export::Reexport::DLLName { lib, export }) => {
+                            ExportTarget::ForwardName {
+                                dll_path: canonical_module_path(lib),
+                                symbol: export.to_ascii_lowercase(),
+                            }
+                        }
+                        Some(goblin::pe::export::Reexport::DLLOrdinal { lib, ordinal }) => {
+                            ExportTarget::ForwardOrdinal {
+                                dll_path: canonical_module_path(lib),
+                                ordinal: *ordinal,
+                            }
+                        }
+                        None => continue,
+                    }
+                }
+            };
+            exports_by_ordinal.insert(ordinal, target);
+        }
+    }
+
+    for export in &pe.exports {
+        let Some(name) = export.name else {
+            continue;
+        };
+        let target = if let Some(reexport) = export.reexport.as_ref() {
+            match reexport {
+                goblin::pe::export::Reexport::DLLName { lib, export } => {
+                    ExportTarget::ForwardName {
+                        dll_path: canonical_module_path(lib),
+                        symbol: export.to_ascii_lowercase(),
+                    }
+                }
+                goblin::pe::export::Reexport::DLLOrdinal { lib, ordinal } => {
+                    ExportTarget::ForwardOrdinal {
+                        dll_path: canonical_module_path(lib),
+                        ordinal: *ordinal,
+                    }
+                }
+            }
+        } else {
+            ExportTarget::Address(image_base + export.rva as u64)
+        };
+        exports_by_name.insert(name.to_ascii_lowercase(), target);
+    }
+
+    (exports_by_name, exports_by_ordinal)
+}
+
+fn resolve_imports(pe: &PE<'_>, image_base: u64) -> Result<(), NtStatus> {
+    for import in &pe.imports {
+        let dll_path = canonical_module_path(import.dll);
+        let module = load_module(&dll_path)?;
+        let symbol = if import.name.starts_with("ORDINAL ") {
+            resolve_export_ordinal(&module, import.ordinal as usize)?
+        } else {
+            resolve_export_name(&module, &import.name.to_ascii_lowercase())?
+        };
+        unsafe {
+            *((image_base + import.offset as u64) as *mut u64) = symbol;
+        }
+    }
+    Ok(())
+}
+
+fn entry_rva(entry: &goblin::pe::export::ExportAddressTableEntry) -> usize {
+    match entry {
+        goblin::pe::export::ExportAddressTableEntry::ExportRVA(rva)
+        | goblin::pe::export::ExportAddressTableEntry::ForwarderRVA(rva) => *rva as usize,
+    }
+}
+
+fn resolve_export_name(module: &LoadedImage, symbol: &str) -> Result<u64, NtStatus> {
+    let Some(target) = module.exports_by_name.get(symbol) else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    resolve_export_target(target)
+}
+
+fn resolve_export_ordinal(module: &LoadedImage, ordinal: usize) -> Result<u64, NtStatus> {
+    let Some(target) = module.exports_by_ordinal.get(&ordinal) else {
+        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+    };
+    resolve_export_target(target)
+}
+
+fn resolve_export_target(target: &ExportTarget) -> Result<u64, NtStatus> {
+    match target {
+        ExportTarget::Address(address) => Ok(*address),
+        ExportTarget::ForwardName { dll_path, symbol } => {
+            let module = load_module(dll_path)?;
+            resolve_export_name(&module, symbol)
+        }
+        ExportTarget::ForwardOrdinal { dll_path, ordinal } => {
+            let module = load_module(dll_path)?;
+            resolve_export_ordinal(&module, *ordinal)
+        }
+    }
+}
+
+fn module_basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+fn canonical_module_path(name: &str) -> String {
+    if name.starts_with('\\') || name.contains(':') {
+        return nt::canonicalize_nt_path(name);
+    }
+    let normalized = name.replace('/', "\\");
+    if normalized.contains('\\') {
+        return nt::canonicalize_nt_path(&normalized);
+    }
+    nt::canonicalize_nt_path(&format!("\\SystemRoot\\System32\\{}", normalized))
 }
 
 fn protect_region(start: u64, len: u64, prot: u32) -> Result<(), NtStatus> {
@@ -1259,7 +1615,13 @@ fn section_to_protection(characteristics: u32) -> u32 {
 
 fn build_process_environment(nt_path: &str, stack_top: u64) -> Result<(u64, u64, u64), NtStatus> {
     let env_base = USER_ENV_BASE;
-    map_region(env_base, USER_ENV_PAGES * PAGE_SIZE, nt::PAGE_READWRITE)?;
+    if let Err(status) = map_region(env_base, USER_ENV_PAGES * PAGE_SIZE, nt::PAGE_READWRITE) {
+        println!(
+            "NT KERNEL: env map failed path={} base={:#x} pages={} status={:#x}",
+            nt_path, env_base, USER_ENV_PAGES, status
+        );
+        return Err(status);
+    }
     let mut cursor = env_base;
     let image_utf16: Vec<u16> = nt_path.encode_utf16().collect();
     let cmd_utf16: Vec<u16> = nt_path.encode_utf16().collect();
