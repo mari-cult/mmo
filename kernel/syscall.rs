@@ -212,7 +212,7 @@ extern "sysv64" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             frame.a3 as *const i64,
             frame.a4 as u32,
             frame.a5 as u32,
-            stack_arg(frame, 0),
+            stack_arg(frame, 2),
         ) as usize,
         nt::SYSCALL_NT_MAP_VIEW_OF_SECTION => user::map_view_of_section(
             frame.a0,
@@ -245,14 +245,24 @@ extern "sysv64" fn syscall_dispatch(frame: *mut SyscallFrame) -> usize {
             user::create_event(frame.a0 as *mut usize, frame.a3 as u32, frame.a4 != 0) as usize
         }
         nt::SYSCALL_NT_SET_EVENT => user::set_event(frame.a0, frame.a1 as *mut i32) as usize,
-        nt::SYSCALL_NT_WAIT_FOR_SINGLE_OBJECT => user::wait_for_single_object(frame.a0) as usize,
-        nt::SYSCALL_NT_CREATE_USER_PROCESS => nt::STATUS_NOT_IMPLEMENTED as usize,
+        nt::SYSCALL_NT_WAIT_FOR_SINGLE_OBJECT => {
+            user::wait_for_single_object(frame.a0, frame.a1 != 0, frame.a2 as *const i64) as usize
+        }
+        nt::SYSCALL_NT_CREATE_USER_PROCESS => user::create_user_process(
+            frame.a0 as *mut usize,
+            frame.a1 as *mut usize,
+            stack_arg(frame, 4) as *const nt::RtlUserProcessParameters,
+        ) as usize,
         nt::SYSCALL_NT_TERMINATE_PROCESS => {
             user::terminate_process(frame.a0, frame.a1 as i32) as usize
         }
         nt::SYSCALL_NT_TERMINATE_THREAD => {
             user::terminate_thread(frame.a0, frame.a1 as i32) as usize
         }
+        nt::SYSCALL_NT_DELAY_EXECUTION => {
+            user::delay_execution(frame.a0 != 0, frame.a1 as *const i64) as usize
+        }
+        nt::SYSCALL_NT_QUERY_SYSTEM_TIME => user::query_system_time(frame.a0 as *mut i64) as usize,
         _ => nt::STATUS_NOT_IMPLEMENTED as usize,
     }
 }

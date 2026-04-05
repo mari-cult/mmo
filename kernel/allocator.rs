@@ -144,7 +144,7 @@ unsafe impl FrameAllocator<Size4KiB> for UefiFrameAllocator {
 }
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
@@ -180,6 +180,7 @@ pub fn init_heap(
     unsafe {
         ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
+    HEAP_BASE.store(HEAP_START as u64, Ordering::SeqCst);
 
     Ok(())
 }
@@ -190,6 +191,7 @@ use linked_list_allocator::LockedHeap;
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
+static HEAP_BASE: AtomicU64 = AtomicU64::new(HEAP_START as u64);
 static RUNTIME_READY: AtomicBool = AtomicBool::new(false);
 pub static FRAME_ALLOCATOR: Lazy<Mutex<Option<RuntimeFrameAllocator>>> =
     Lazy::new(|| Mutex::new(None));
@@ -208,6 +210,14 @@ pub fn init_runtime_with_allocator(
     PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
     *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
     RUNTIME_READY.store(true, Ordering::SeqCst);
+}
+
+pub fn set_heap_base(addr: u64) {
+    HEAP_BASE.store(addr, Ordering::SeqCst);
+}
+
+pub fn heap_base() -> u64 {
+    HEAP_BASE.load(Ordering::SeqCst)
 }
 
 #[cfg(target_os = "uefi")]

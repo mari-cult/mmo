@@ -1,6 +1,7 @@
 # To Do
 
-- [ ] PE Import/DLL loading
-- [ ] Relocation handling
-- [ ] NtCreateUserProcess 
-- [ ] SEC_IMage section mapping
+- [x] PE Import/DLL loading
+- [x] Relocation handling
+- [x] NtCreateUserProcess
+- [x] NtWaitForSingleObject
+- [ ] KMDF/WDDM (Driver Model)

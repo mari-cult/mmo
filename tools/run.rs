@@ -18,6 +18,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         &root,
         "//userspace/native_init:native_init[init]",
     )?);
+    let child_exe = env_path("BUCK_CHILD_EXE").unwrap_or(buck_output(
+        &root,
+        "//userspace/native_init:native_init[child]",
+    )?);
     let ntdll_dll = env_path("BUCK_NTDLL_DLL").unwrap_or(buck_output(
         &root,
         "//userspace/native_init:native_init[ntdll_dll]",
@@ -36,6 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let kernel_rootfstype = env::var("KERNEL_ROOTFSTYPE").unwrap_or_else(|_| "crabfs".to_string());
     let kernel_cmdline = env::var("KERNEL_CMDLINE").unwrap_or_default();
     let rootfs_size_mib = env::var("ROOTFS_SIZE_MIB").unwrap_or_default();
+    let qemu_mem = env::var("QEMU_MEM").unwrap_or_else(|_| "512M".to_string());
     let empty_rootfs_dir = root.join(".empty-rootfs");
 
     if let Some(path) = env::var_os("KERNEL_RUSTFLAGS") {
@@ -51,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
         install_native_init_to_dir(
             &native_init_exe,
+            &child_exe,
             &ntdll_dll,
             Path::new(&gentoo_stage3_staging),
         )?;
@@ -63,6 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else if Path::new(&gentoo_stage3_staging).is_dir() {
         install_native_init_to_dir(
             &native_init_exe,
+            &child_exe,
             &ntdll_dll,
             Path::new(&gentoo_stage3_staging),
         )?;
@@ -75,7 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         remove_if_exists(&empty_rootfs_dir)?;
         fs::create_dir_all(empty_rootfs_dir.join("Windows/System32"))?;
-        install_native_init_to_dir(&native_init_exe, &ntdll_dll, &empty_rootfs_dir)?;
+        install_native_init_to_dir(&native_init_exe, &child_exe, &ntdll_dll, &empty_rootfs_dir)?;
         build_rootfs_from_dir(
             &mkrootfs_bin,
             &empty_rootfs_dir,
@@ -115,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "-display".to_string(),
         "none".to_string(),
         "-m".to_string(),
-        "256M".to_string(),
+        qemu_mem,
     ];
     if cfg!(target_os = "linux") && Path::new("/dev/kvm").exists() {
         qemu_args.push("-accel".to_string());
@@ -199,6 +206,7 @@ fn run_import_rootfs(root: &Path, tarball: &Path, staging: &Path) -> Result<(), 
 
 fn install_native_init_to_dir(
     native_init_exe: &Path,
+    child_exe: &Path,
     ntdll_dll: &Path,
     target_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
@@ -207,6 +215,7 @@ fn install_native_init_to_dir(
         native_init_exe,
         &target_dir.join("Windows/System32/init.exe"),
     )?;
+    copy_file(child_exe, &target_dir.join("Windows/System32/child.exe"))?;
     copy_file(ntdll_dll, &target_dir.join("Windows/System32/ntdll.dll"))?;
     Ok(())
 }

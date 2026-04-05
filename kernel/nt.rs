@@ -25,6 +25,8 @@ pub const STATUS_INFO_LENGTH_MISMATCH: NtStatus = 0xC000_0004u32 as i32;
 pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023u32 as i32;
 pub const STATUS_END_OF_FILE: NtStatus = 0xC000_0011u32 as i32;
 pub const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001u32 as i32;
+pub const STATUS_PENDING: NtStatus = 0x0000_0103u32 as i32;
+pub const STATUS_TIMEOUT: NtStatus = 0x0000_0102u32 as i32;
 pub const STATUS_IMAGE_MACHINE_TYPE_MISMATCH: NtStatus = 0x4000_002Eu32 as i32;
 pub const STATUS_INVALID_IMAGE_FORMAT: NtStatus = 0xC000_007Bu32 as i32;
 pub const STATUS_NOT_SUPPORTED: NtStatus = 0xC000_00BBu32 as i32;
@@ -97,6 +99,8 @@ pub const SYSCALL_NT_WAIT_FOR_SINGLE_OBJECT: usize = 15;
 pub const SYSCALL_NT_CREATE_USER_PROCESS: usize = 16;
 pub const SYSCALL_NT_TERMINATE_PROCESS: usize = 17;
 pub const SYSCALL_NT_TERMINATE_THREAD: usize = 18;
+pub const SYSCALL_NT_DELAY_EXECUTION: usize = 19;
+pub const SYSCALL_NT_QUERY_SYSTEM_TIME: usize = 20;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -104,6 +108,13 @@ pub struct UnicodeString {
     pub length: u16,
     pub maximum_length: u16,
     pub buffer: *const u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ListEntry {
+    pub flink: *mut ListEntry,
+    pub blink: *mut ListEntry,
 }
 
 #[repr(C)]
@@ -205,6 +216,32 @@ pub struct Peb {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct PebLdrData {
+    pub length: u32,
+    pub initialized: u8,
+    pub reserved: [u8; 3],
+    pub ss_handle: usize,
+    pub in_load_order_module_list: ListEntry,
+    pub in_memory_order_module_list: ListEntry,
+    pub in_initialization_order_module_list: ListEntry,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LdrDataTableEntry {
+    pub in_load_order_links: ListEntry,
+    pub in_memory_order_links: ListEntry,
+    pub in_initialization_order_links: ListEntry,
+    pub dll_base: usize,
+    pub entry_point: usize,
+    pub size_of_image: u32,
+    pub reserved: u32,
+    pub full_dll_name: UnicodeString,
+    pub base_dll_name: UnicodeString,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct Teb {
     pub reserved1: [usize; 12],
     pub process_environment_block: *mut Peb,
@@ -246,12 +283,16 @@ pub struct SectionObject {
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessObject {
     pub pid: u32,
+    pub signaled: bool,
+    pub exit_status: NtStatus,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadObject {
     pub tid: usize,
     pub pid: u32,
+    pub signaled: bool,
+    pub exit_status: NtStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -400,12 +441,27 @@ pub fn create_section(path: Option<String>, protection: u32, attributes: u32, si
 
 pub fn create_process(pid: u32) -> u32 {
     let mut objects = OBJECTS.lock();
-    insert_unnamed(&mut objects, ObjectData::Process(ProcessObject { pid }))
+    insert_unnamed(
+        &mut objects,
+        ObjectData::Process(ProcessObject {
+            pid,
+            signaled: false,
+            exit_status: STATUS_PENDING,
+        }),
+    )
 }
 
 pub fn create_thread(pid: u32, tid: usize) -> u32 {
     let mut objects = OBJECTS.lock();
-    insert_unnamed(&mut objects, ObjectData::Thread(ThreadObject { pid, tid }))
+    insert_unnamed(
+        &mut objects,
+        ObjectData::Thread(ThreadObject {
+            pid,
+            tid,
+            signaled: false,
+            exit_status: STATUS_PENDING,
+        }),
+    )
 }
 
 pub fn retain(object_id: u32) -> Result<(), NtStatus> {
@@ -466,6 +522,59 @@ pub fn with_section<T>(object_id: u32, f: impl FnOnce(&SectionObject) -> T) -> R
     };
     match &record.data {
         ObjectData::Section(section) => Ok(f(section)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_process<T>(
+    object_id: u32,
+    f: impl FnOnce(&ProcessObject) -> T,
+) -> Result<T, NtStatus> {
+    let objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &record.data {
+        ObjectData::Process(process) => Ok(f(process)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_process_mut<T>(
+    object_id: u32,
+    f: impl FnOnce(&mut ProcessObject) -> T,
+) -> Result<T, NtStatus> {
+    let mut objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get_mut(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &mut record.data {
+        ObjectData::Process(process) => Ok(f(process)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_thread<T>(object_id: u32, f: impl FnOnce(&ThreadObject) -> T) -> Result<T, NtStatus> {
+    let objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &record.data {
+        ObjectData::Thread(thread) => Ok(f(thread)),
+        _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+    }
+}
+
+pub fn with_thread_mut<T>(
+    object_id: u32,
+    f: impl FnOnce(&mut ThreadObject) -> T,
+) -> Result<T, NtStatus> {
+    let mut objects = OBJECTS.lock();
+    let Some(record) = objects.objects.get_mut(&object_id) else {
+        return Err(STATUS_INVALID_HANDLE);
+    };
+    match &mut record.data {
+        ObjectData::Thread(thread) => Ok(f(thread)),
         _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
     }
 }

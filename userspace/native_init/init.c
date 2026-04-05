@@ -17,6 +17,7 @@ typedef HANDLE *PHANDLE;
 
 #define STATUS_SUCCESS 0
 #define STATUS_END_OF_FILE ((NTSTATUS)0xC0000011u)
+#define STATUS_TIMEOUT ((NTSTATUS)0x00000102u)
 #define PROCESS_BASIC_INFORMATION_CLASS 0
 #define FILE_GENERIC_READ 0x00120089u
 #define FILE_OPEN 0x00000001u
@@ -123,6 +124,21 @@ extern NTSTATUS NtCreateEvent(
 );
 extern NTSTATUS NtSetEvent(HANDLE EventHandle, long *PreviousState);
 extern NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, i64 *Timeout);
+extern NTSTATUS NtCreateUserProcess(
+    PHANDLE ProcessHandle,
+    PHANDLE ThreadHandle,
+    u32 ProcessDesiredAccess,
+    u32 ThreadDesiredAccess,
+    OBJECT_ATTRIBUTES *ProcessObjectAttributes,
+    OBJECT_ATTRIBUTES *ThreadObjectAttributes,
+    u32 ProcessFlags,
+    u32 ThreadFlags,
+    RTL_USER_PROCESS_PARAMETERS *ProcessParameters,
+    void *CreateInfo,
+    void *AttributeList
+);
+extern NTSTATUS NtDelayExecution(BOOLEAN Alertable, i64 *DelayInterval);
+extern NTSTATUS NtQuerySystemTime(i64 *SystemTime);
 extern NTSTATUS NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus);
 
 static void init_unicode_string(UNICODE_STRING *out, u16 *buffer) {
@@ -166,16 +182,27 @@ void start(void) {
         '\\','S','y','s','t','e','m','R','o','o','t','\\','S','y','s','t','e','m','3','2','\\',
         'i','n','i','t','.','e','x','e',0
     };
+    static u16 child_path[] = {
+        '\\','S','y','s','t','e','m','R','o','o','t','\\','S','y','s','t','e','m','3','2','\\',
+        'c','h','i','l','d','.','e','x','e',0
+    };
 
     HANDLE stdout_handle = query_stdout();
     HANDLE file = 0;
     HANDLE event = 0;
+    HANDLE child_process = 0;
+    HANDLE child_thread = 0;
     IO_STATUS_BLOCK iosb;
     OBJECT_ATTRIBUTES attrs;
     UNICODE_STRING path;
+    UNICODE_STRING child_us;
     char buffer[96];
     long previous_state = 0;
     NTSTATUS status;
+    RTL_USER_PROCESS_PARAMETERS child_params;
+    i64 system_time_before = 0;
+    i64 system_time_after = 0;
+    i64 delay_interval = -100000;
 
     init_unicode_string(&path, init_path);
     attrs.Length = (u32)sizeof(attrs);
@@ -186,6 +213,15 @@ void start(void) {
     attrs.SecurityQualityOfService = NULL;
 
     write_console(stdout_handle, "native init: starting\r\n");
+
+    status = NtQuerySystemTime(&system_time_before);
+    if (status == STATUS_SUCCESS) {
+        status = NtDelayExecution(0, &delay_interval);
+        if (status == STATUS_SUCCESS && NtQuerySystemTime(&system_time_after) == STATUS_SUCCESS &&
+            system_time_after >= system_time_before) {
+            write_console(stdout_handle, "native init: time query/delay succeeded\r\n");
+        }
+    }
 
     status = NtCreateFile(
         &file,
@@ -209,6 +245,49 @@ void start(void) {
         NtClose(file);
     } else {
         write_console(stdout_handle, "native init: NtCreateFile failed\r\n");
+    }
+
+    init_unicode_string(&child_us, child_path);
+    child_params.Length = (u32)sizeof(child_params);
+    child_params.MaximumLength = (u32)sizeof(child_params);
+    child_params.Flags = 0;
+    child_params.DebugFlags = 0;
+    child_params.ConsoleHandle = 0;
+    child_params.StandardInput = 0;
+    child_params.StandardOutput = stdout_handle;
+    child_params.StandardError = stdout_handle;
+    child_params.ImagePathName = child_us;
+    child_params.CommandLine = child_us;
+
+    status = NtCreateUserProcess(
+        &child_process,
+        &child_thread,
+        0x001fffffu,
+        0x001fffffu,
+        NULL,
+        NULL,
+        0,
+        0,
+        &child_params,
+        NULL,
+        NULL
+    );
+    if (status == STATUS_SUCCESS) {
+        i64 poll_timeout = 0;
+        NTSTATUS poll = NtWaitForSingleObject(child_process, 0, &poll_timeout);
+        if (poll == STATUS_TIMEOUT) {
+            write_console(stdout_handle, "native init: child poll timed out as expected\r\n");
+        }
+        status = NtWaitForSingleObject(child_process, 0, NULL);
+        if (status == STATUS_SUCCESS) {
+            write_console(stdout_handle, "native init: child process completed\r\n");
+        } else {
+            write_console(stdout_handle, "native init: child wait failed\r\n");
+        }
+        NtClose(child_thread);
+        NtClose(child_process);
+    } else {
+        write_console(stdout_handle, "native init: NtCreateUserProcess failed\r\n");
     }
 
     status = NtCreateEvent(&event, 0x1f0003u, NULL, EVENT_TYPE_NOTIFICATION, 0);

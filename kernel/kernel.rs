@@ -110,6 +110,7 @@ fn efi_main(
             .lock()
             .init(heap_ptr as *mut u8, allocator::HEAP_SIZE);
     }
+    allocator::set_heap_base(heap_ptr);
 
     println!(
         "NT KERNEL: Heap initialized via UEFI at {:p}",

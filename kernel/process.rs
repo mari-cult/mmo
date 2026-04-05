@@ -819,6 +819,10 @@ pub fn allocate_task_id() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().allocate_task_id())
 }
 
+pub fn global_tick() -> u64 {
+    x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().global_tick)
+}
+
 pub fn on_task_exit() -> ! {
     x86_64::instructions::interrupts::disable();
 

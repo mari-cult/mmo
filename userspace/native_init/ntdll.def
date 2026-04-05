@@ -19,4 +19,6 @@ EXPORTS
     NtCreateUserProcess
     NtTerminateProcess
     NtTerminateThread
+    NtDelayExecution
+    NtQuerySystemTime
     NtdllRelocAnchorData DATA
